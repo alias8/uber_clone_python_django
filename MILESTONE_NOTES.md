@@ -164,12 +164,108 @@ history produced.
   constructor argument, so `SurgeCache.get()` needed a documented `cast("str | None", ...)` — this
   is a different, narrower gap than the existing `many=True` mypy exception, not an extension of it.
 
+## Milestone 4 — Celery-driven Kafka dispatch
+
+The one milestone James deliberately chose to diverge from the FastAPI sibling's architecture on:
+Celery + a dedicated Kafka-to-Celery bridge process, not an asyncio consumer loop. See README's
+"Celery" section for the full pipeline diagram and reasoning.
+
+- `kafka_producer.py`: a plain synchronous `kafka.KafkaProducer` (kafka-python-ng), cached as a
+  process-wide singleton by bootstrap-servers string — same reasoning as `redis_client.py`, no
+  event loop for a client to get bound to, so none of the FastAPI sibling's per-loop caching is
+  needed. Wired into `services.py`'s four ride-state transitions, replacing the `# ... deferred`
+  comments M1-M3 left in place.
+- `dispatch.py` gained `fanout_to_nearby_drivers()` (Redis `SADD`+`EXPIRE` on `dispatched:{rideId}`,
+  then `PUBLISH` a ride-offer payload per nearby driver — same wire format as the Kotlin/FastAPI
+  versions) and `clear_dispatch()` (just deletes the dispatched-drivers key — see below for why
+  it doesn't also notify other drivers the way the reference implementations' handler does).
+- `tasks.py`: five Celery tasks — `handle_ride_requested`/`_accepted`/`_completed`/`_cancelled`
+  (ported from `KafkaConsumer.kt`'s four `@KafkaListener`s, minus their SSE-emitting lines) and
+  `retry_stale_rides` (a Celery Beat periodic task on the sibling's 60s/2-minute timing, replacing
+  its `asyncio.sleep`-loop task).
+- `kafka_bridge.py` + `management/commands/consume_kafka.py`: the actual Kafka consumer. Reads
+  the four topics with a blocking `kafka.KafkaConsumer` and calls `.delay(ride_id)` per message —
+  no domain logic of its own, by design (see claude.md).
+- **Deliberate scope trim vs. the reference implementations**: `clear_dispatch()` only clears the
+  `dispatched:{rideId}` key. `KafkaConsumer.kt`'s ride-accepted handler (and the FastAPI port of
+  it) also directly notifies every other dispatched driver their offer is cancelled — but it does
+  that by calling straight into the same process's in-memory SSE registry, never touching Redis.
+  This project's Celery worker and its future Channels layer (M5) are separate processes, so
+  there's no in-process registry to call here, and inventing a new Redis pub/sub wire format for
+  "offer cancelled" right now would mean guessing at what M5 actually needs before M5 exists.
+  Deferred that one notification to M5 rather than building it twice.
+- **A real, multi-round dependency-resolution fight, not a code bug**: adding `celery[redis]` and
+  `kafka-python-ng` triggered a chain of version conflicts once actually resolved by pip (not
+  just guessed at):
+  1. `celery[redis]` (via `kombu`) caps `redis-py` at `<6.0`/`<6.5` depending on the celery
+     version — celery `<5.6.3` requires `<6.0`, `>=5.6.3` relaxed it to `<6.5`. Pinned
+     `celery[redis]>=5.6.3` specifically for that relaxed cap.
+  2. `testcontainers`'s own `redis` extra requires `redis-py>=7` — directly incompatible with
+     celery's `<6.5` cap, an unresolvable conflict as long as both extras are requested. Fixed by
+     dropping testcontainers' `redis` extra entirely (`testcontainers[postgres,kafka]`, not
+     `[postgres,redis,kafka]`) — `RedisContainer` doesn't actually need that extra's specific
+     `redis-py` pin, just *some* `redis` package importable, which this project already installs.
+  3. Along the way, an intermediate resolution silently downgraded `testcontainers` from 4.15.0 to
+     4.13.3 to satisfy an earlier (wrong) version combination — which broke `tests/conftest.py`
+     immediately, since `testcontainers.community.{postgres,redis,kafka}` (the module path M2/M3
+     already used) doesn't exist in 4.13.x at all, only at the top level. Pinned
+     `testcontainers[...]>=4.15` explicitly once the redis conflict above was fixed, rather than
+     leaving the version unconstrained and hoping the resolver picks right.
+  4. The redis-py downgrade (8.1.0 → 6.4.0, forced by celery's cap) also surfaced a new
+     mypy-strict regression in `rate_limit.py`'s `RateLimiter.allow()` (`incr()`'s stub started
+     resolving to an `Awaitable`-inclusive union) — same class of gap as `pricing.py`'s existing
+     `get()` cast, fixed the same way.
+
+  None of this was a code defect — every individual constraint was correct in isolation, they
+  just didn't have a shared solution until the redis version ranges were narrowed by hand. Full
+  reasoning is in `pyproject.toml`'s comments next to each pin.
+- **Real bug, caught while writing the stale-retry test, not by inspection**: a
+  `kafka.KafkaConsumer` with `auto_offset_reset="latest"` only actually joins its consumer group
+  and fixes its starting offset on the *first poll*, not at construction time. The stale-retry
+  test built its probe consumer, then called `tasks.retry_stale_rides()` (which publishes before
+  the probe has polled even once) — the probe's "latest" position ended up set to a point *after*
+  the message it was supposed to catch, so it just timed out. Fixed with an explicit
+  `probe.poll(timeout_ms=1000)` before triggering the publish, forcing group-join/position-fixing
+  to happen first. aiokafka's `await consumer.start()` in the FastAPI sibling doesn't return until
+  an equivalent readiness point, which is why that sibling's own version of this test doesn't need
+  the extra step.
+- **`celery.contrib.pytest` isn't auto-registered as a `pytest11` entry point** in this celery
+  version — `tests/conftest.py` opts in explicitly (`pytest_plugins = ("celery.contrib.pytest",)`)
+  and overrides its default `celery_app`/`celery_config` fixtures to point at this project's real
+  Celery app rather than a throwaway one with no tasks registered. That override then hit a
+  second, smaller issue: `celery_worker`'s startup check asserts `celery.ping` is registered, but
+  that task is a `@shared_task` defined in `celery.contrib.testing.tasks` (not a real celery
+  builtin) that only attaches to an app finalized *after* the module is imported — the plugin's
+  own default test app imports it implicitly, a plain `Celery()` app doesn't. Fixed by importing
+  `celery.contrib.testing.tasks` before calling `.finalize()` in the `celery_app` fixture.
+- **`_reset_state` switched from pytest-django's `db` fixture to `transactional_db`.** The one
+  true end-to-end test needs a real Celery worker thread — its own DB connection — to see a ride
+  the test just created; a rollback-based transaction (what `db` gives you) is invisible across
+  connections, so the worker would never find it. `transactional_db` commits for real and
+  truncates between tests instead — slightly slower, but the only way that test's guarantee (the
+  actual wiring works, not just the function bodies) is real rather than accidental.
+- Tests: `tests/test_dispatch.py`, 8 new — fan-out writes the dispatched key/TTL and publishes the
+  right payload; fan-out with no nearby drivers writes nothing; `handle_ride_requested` dispatches
+  when still `REQUESTED` and no-ops otherwise; `handle_ride_accepted` clears the dispatched key;
+  stale-ride retry republishes an old ride and leaves recent ones alone; and the one true
+  end-to-end test (real Kafka broker, the actual `kafka_bridge.consume_forever()` loop in a
+  background thread, and a real Celery worker via the `celery_worker` fixture — not just the task
+  functions called directly like every other test here). 63 tests passing total (55 + 8),
+  `ruff check .` and `mypy --strict` clean.
+- Manually verified the entire live pipeline with all four processes running against real local
+  Postgres/Redis/Kafka (`runserver`, `celery worker`, `celery beat`, `manage.py consume_kafka`):
+  requesting a ride produced a real `dispatched:{rideId}` Redis key with the correct driver via
+  the actual Kafka → bridge → Celery round-trip (confirmed in the worker's own log, not just
+  Redis state); accepting cleared that key the same way; a full lifecycle
+  (register → driver online → request → accept → start → complete → rate) worked end to end over
+  real HTTP; and Celery Beat's own scheduler log confirmed it fired `retry-stale-rides` on its
+  60-second interval, not just that the schedule was configured.
+
 ## What's left
 
-- **Milestone 4** — Celery: the Kafka-consuming dispatch pipeline
-  (`ride-requested`/`accepted`/`completed`/`cancelled`) + the stale-ride retry job.
 - **Milestone 5** — Django Channels: the SSE-equivalent endpoints (`/rides/{id}/location`,
-  `/driver/offers`).
+  `/driver/offers`), plus the offer-cancelled-to-other-drivers notification M4 deferred (see
+  above).
 
 Milestones 6 (Docker/CI against real infra) and 7 (the AWS deployment doc port) are cancelled by
 James, not deferred — don't build them.

@@ -45,8 +45,16 @@ rides/                  The one Django app this domain lives in
                            caching needed; this app has no asyncio event loop, see docstring)
   geo.py                   Haversine distance + ETA (ported from GeoUtils.kt)
   pricing.py               Fare + surge formulas; surge cache is real Redis (M3, see above)
-  dispatch.py              Nearby-driver search via Redis GEOSEARCH + the availability set (M3)
+  dispatch.py              Nearby-driver search via Redis GEOSEARCH + the availability set (M3),
+                           plus the ride-offer fan-out and dispatched-key cleanup (M4)
   rate_limit.py            Redis-backed fixed-window limiter (`INCR`+`EXPIRE`, M3)
+  kafka_producer.py         Publishes ride-requested/accepted/completed/cancelled (M4)
+  kafka_bridge.py           Kafka-to-Celery bridge: reads Kafka, enqueues a Celery task per
+                            message — see "Celery" below for why this is a separate module
+  tasks.py                  Celery tasks: the four ride-event handlers + the stale-ride retry
+                            periodic task (M4)
+  management/commands/
+    consume_kafka.py          Runs kafka_bridge.consume_forever() as its own process
   services.py              DriverService / RideService / RatingService — the domain logic
   state.py                 Process-wide singletons wiring repos + services together
   auth/
@@ -107,6 +115,53 @@ names/formats as `uber_clone`'s `DriverService.kt`/`PricingGrpcService.kt`/`Rate
 
 Configure via the `REDIS_URL` env var (default: `redis://localhost:6379/0`).
 
+## Celery
+
+This is the milestone James deliberately chose to diverge from the FastAPI sibling's
+architecture on: that project runs one `asyncio` consumer loop, started from its app's own
+lifespan, in the same process that serves HTTP. This project splits the same job across three
+separate processes instead, because that's how a real Django shop actually runs this kind of
+pipeline, not because the domain needs three processes:
+
+```
+POST /rides ──(sync)──> kafka_producer.publish_ride_requested()
+                              │
+                        Kafka: ride-requested
+                              │
+              `manage.py consume_kafka` (kafka_bridge.py)
+                    reads Kafka, calls task.delay(ride_id)
+                              │
+                    Celery broker (Redis)
+                              │
+              `celery -A config worker` picks it up,
+                 runs rides/tasks.py::handle_ride_requested
+                    → dispatch.py's Redis fan-out
+```
+
+`kafka_bridge.py` only reads Kafka and enqueues a task — it does no domain work itself. That
+split is deliberate: a lightweight bridge process is easy to reason about and restart, while the
+actual ride-lifecycle logic gets Celery's retry handling, concurrency, and worker pool for free,
+rather than being folded into a hand-rolled consume loop. Kafka publishing (the producer side)
+stays a plain synchronous call from request-handling code — no bridge needed for that direction.
+
+The stale-ride retry job (`StaleRideRetryJob.kt` / the FastAPI sibling's `asyncio.sleep` loop) is
+`rides.retry_stale_rides`, a Celery Beat periodic task on the same 60-second interval — see
+`config/settings.py`'s `CELERY_BEAT_SCHEDULE`.
+
+Running the full pipeline locally needs four processes: `python manage.py runserver`,
+`celery -A config worker -l info`, `celery -A config beat -l info`, and
+`python manage.py consume_kafka`. Redis (already required from M3) doubles as the Celery broker
+and result backend — no second broker technology introduced just for task queuing. Configure
+Kafka via the `KAFKA_BOOTSTRAP_SERVERS` env var (default: `localhost:9092`).
+
+One consequence of the process split worth naming: in the Kotlin/FastAPI single-process design,
+the ride-accepted handler directly notifies other dispatched drivers their offer is gone via an
+in-process SSE emit — no Redis involved, since the handler and the SSE registry share a process.
+Here, the Celery worker (this milestone) and the Channels layer (M5) are separate processes by
+design, so there's no in-process registry to call from `dispatch.py::clear_dispatch()`. That
+notification is deferred to M5, which will own the actual cross-process delivery mechanism
+rather than this milestone guessing at one.
+
 ## Ported faithfully vs. reimplemented
 
 Kept exact (same constants, same formulas, ported test cases prove numeric parity): Haversine +
@@ -156,16 +211,44 @@ Genuinely reimplemented, where idiomatic Django/DRF differs enough to be worth n
   `redis_client.py` is a plain process-wide singleton, the exact case that sibling's own docstring
   warns you away from, safely, because the reason it's unsafe there doesn't exist here.
 - **`django.test.TestCase`'s transaction rollback → per-test DB reset, no manual `TRUNCATE`
-  needed.** The FastAPI sibling's tests reset Postgres between tests with a manual
-  `TRUNCATE ... RESTART IDENTITY CASCADE`. Depending on pytest-django's `db` fixture wraps each
-  test in its own transaction against the real testcontainers Postgres and rolls it back
-  afterward — real per-test isolation "for free," a Django-idiomatic simplification over the
-  sibling's approach. Process-local state (the driver location overlay, the pricing cache, both
-  rate limiters) still needs clearing directly, same as the sibling — that isn't a database row.
+  needed** (M2/M3) **— though M4 had to trade that back for `transactional_db`.** Depending on
+  pytest-django's plain `db` fixture wraps each test in its own transaction and rolls it back
+  afterward, which is invisible across connections — a real Celery worker thread (M4's one true
+  end-to-end test) opens its own DB connection to pick up a task and would never see a row only
+  visible inside the test's own uncommitted transaction. `tests/conftest.py`'s `_reset_state` now
+  depends on `transactional_db` (commits for real, truncates between tests) project-wide instead,
+  slightly slower but necessary for that one test's guarantee to be real. Process-local state (the
+  driver location overlay, the pricing cache, both rate limiters) still needs clearing directly,
+  same as the FastAPI sibling — that isn't a database row.
+- **asyncio consumer loop → Celery + a separate Kafka-to-Celery bridge process.** See "Celery"
+  above for the full architecture and why — this is the one milestone where the two projects'
+  shapes genuinely diverge, by design.
+- **A real dependency-resolution conflict, not a code bug**: `celery[redis]` (via `kombu`) caps
+  `redis-py` to `<6.5`, while `testcontainers`'s own `redis` extra requires `redis-py>=7` — the
+  two can't be installed together. Resolved by not requesting testcontainers' `redis` extra at
+  all (`testcontainers[postgres,kafka]`, not `[postgres,redis,kafka]`); `RedisContainer` itself
+  only needs *some* `redis` package importable, not a specific version, since this project
+  already depends on one for its own client. See `pyproject.toml`'s comments and
+  `MILESTONE_NOTES.md` for the full chain of version conflicts this milestone hit.
+- **`celery.contrib.pytest` isn't auto-registered.** Unlike `pytest-django`/`testcontainers`'s
+  plugins, celery doesn't declare a `pytest11` entry point in this version — `tests/conftest.py`
+  opts in explicitly via `pytest_plugins = ("celery.contrib.pytest",)`. The `celery_app` fixture
+  is also overridden there to return *this project's real* Celery app (with `rides/tasks.py`'s
+  tasks actually registered) rather than the plugin's default throwaway test app, and to
+  explicitly import `celery.contrib.testing.tasks` before finalizing — the `celery.ping` task
+  `celery_worker`'s startup check requires is a `@shared_task` defined there, not a real celery
+  builtin, and only gets attached to an app that's finalized *after* that module is imported.
+- **`djangorestframework-stubs`' `Serializer.__init__` many=True gap, and `redis-py`'s
+  imprecise-or-absent stubs, keep needing the same targeted-cast treatment** (see "Accepted
+  mypy-strict exceptions" in `claude.md`) — `rate_limit.py`'s `RateLimiter.allow()` needed one for
+  `incr()` this milestone (same class of gap as `pricing.py`'s existing `get()` cast), and
+  `tests/test_dispatch.py`'s pub/sub test needed `# type: ignore[no-untyped-call]` for
+  `pubsub()`/`subscribe()`, which have no stub signature at all rather than just an imprecise one.
 
 ## Running it
 
-Postgres and Redis must both be running (a local install or containers) before either of these:
+Postgres, Redis, and Kafka must all be running (a local install or containers) before any of
+this. Four processes make up the full pipeline as of M4:
 
 ```
 python3 -m venv .venv && source .venv/bin/activate
@@ -173,7 +256,11 @@ pip install -e ".[dev]"
 
 python manage.py migrate   # applies rides' own 3 migrations plus Django's stock auth/
                             # contenttypes tables
-python manage.py runserver
+
+python manage.py runserver              # HTTP API
+celery -A config worker -l info         # runs rides/tasks.py's ride-event handlers
+celery -A config beat -l info           # schedules rides.retry_stale_rides every 60s
+python manage.py consume_kafka          # bridges Kafka -> Celery, see "Celery" above
 ```
 
 ## Checks
@@ -181,25 +268,32 @@ python manage.py runserver
 ```
 ruff check .      # lint
 mypy              # strict type check
-pytest -q         # tests — spins up a real throwaway Postgres AND Redis via testcontainers;
-                   # Docker must be running
+pytest -q         # tests — spins up a real throwaway Postgres, Redis, AND Kafka via
+                   # testcontainers; Docker must be running. The Kafka container is the slow
+                   # part of a cold run (~30-40s to become ready).
 ```
 
 All three run in CI on every push/PR (`.github/workflows/ci.yml`).
 
 ## Status
 
-Milestones 1-3 done: Django/DRF skeleton, JWT-cookie auth with the dual-role design, the full
+Milestones 1-4 done: Django/DRF skeleton, JWT-cookie auth with the dual-role design, the full
 ride state machine, in-process fare/surge quoting, real Postgres persistence via the Django ORM,
-and now real Redis backing driver dispatch, surge caching, and rate limiting — all covered by
-tests against real Postgres and Redis (testcontainers), `mypy --strict` and `pytest` clean. Not
-yet built:
+real Redis backing driver dispatch/surge caching/rate limiting, and now a real Kafka-driven
+dispatch pipeline plus the stale-ride retry job — running through Celery and a dedicated
+Kafka-to-Celery bridge process rather than an asyncio consumer loop (see "Celery" above for why).
+All covered by tests against real Postgres, Redis, and Kafka (testcontainers) — including one
+true end-to-end test exercising the real broker and a real Celery worker, not just direct task
+calls — `mypy --strict` and `pytest` clean. Also manually verified against real local
+Postgres/Redis/Kafka: all four processes running together, a full ride lifecycle
+(register → driver online → request → accept → start → complete → rate) dispatched and
+completed correctly, and Celery Beat's scheduler log confirmed firing `retry-stale-rides` on its
+60-second interval. Not yet built:
 
-- **Milestone 4** — Celery: the Kafka-consuming dispatch pipeline
-  (`ride-requested`/`accepted`/`completed`/`cancelled`) + the stale-ride retry job, as Celery
-  tasks/beat schedule rather than asyncio background tasks
 - **Milestone 5** — Django Channels: the SSE-equivalent endpoints
-  (`/rides/{id}/location`, `/driver/offers`) as WebSocket or SSE-over-ASGI consumers
+  (`/rides/{id}/location`, `/driver/offers`) as WebSocket or SSE-over-ASGI consumers, including
+  the offer-cancelled-to-other-drivers notification `dispatch.py::clear_dispatch()` currently
+  defers (see "Celery" above)
 
 Milestones 6 (Docker/CI against real infra) and 7 (porting the AWS deployment doc) are out of
 scope for this project — cancelled by James rather than deferred.

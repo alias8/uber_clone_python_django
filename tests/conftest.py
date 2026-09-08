@@ -5,10 +5,16 @@ from django.conf import settings as django_settings
 from django.core.management import call_command
 from pytest_django.plugin import DjangoDbBlocker
 from rest_framework.test import APIClient
+from testcontainers.community.kafka import KafkaContainer
 from testcontainers.community.postgres import PostgresContainer
 from testcontainers.community.redis import RedisContainer
 
 from rides.redis_client import get_client
+
+# celery ships celery.contrib.pytest (celery_app/celery_config/celery_worker fixtures) but
+# doesn't register it as a pytest11 entry point in this version — it has to be opted into
+# explicitly, unlike testcontainers/pytest-django's plugins above, which auto-register.
+pytest_plugins = ("celery.contrib.pytest",)
 
 
 @pytest.fixture(scope="session")
@@ -62,11 +68,66 @@ def _redis_setup() -> Iterator[None]:
         yield
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _kafka_setup() -> Iterator[None]:
+    """Points `settings.KAFKA_BOOTSTRAP_SERVERS` at a throwaway Kafka broker for the whole test
+    session — same idea as `_redis_setup` above. `kafka_producer.get_producer()` re-reads
+    `settings.KAFKA_BOOTSTRAP_SERVERS` on every call the same way `redis_client.get_client()`
+    re-reads `settings.REDIS_URL`, so a plain reassignment here is enough.
+
+    Uses the confluentinc/cp-kafka image's default startup wait; that's taken ~30-40s locally
+    for the FastAPI sibling's own Kafka container (see its conftest.py), budget for that on a
+    cold run — much slower than the Postgres/Redis containers above."""
+    kafka = KafkaContainer()
+    kafka.start()
+    try:
+        django_settings.KAFKA_BOOTSTRAP_SERVERS = kafka.get_bootstrap_server()
+        yield
+    finally:
+        kafka.stop()
+
+
+@pytest.fixture(scope="session")
+def celery_config(_redis_setup: None) -> dict[str, str]:
+    """Celery's own pytest plugin (bundled with the `celery` package, no extra dependency needed)
+    reads this fixture to build the `celery_app`/`celery_worker` fixtures used by the one true
+    end-to-end test in test_dispatch.py. Depends on `_redis_setup` explicitly so the broker URL
+    below is the real testcontainers Redis, not the localhost default."""
+    return {"broker_url": django_settings.REDIS_URL, "result_backend": django_settings.REDIS_URL}
+
+
+@pytest.fixture(scope="session")
+def celery_app(celery_config: dict[str, str]) -> object:
+    """Overrides celery's default test-app fixture to return *this project's* real Celery app
+    (config.celery.app) — the throwaway app the plugin builds otherwise has none of
+    rides/tasks.py's tasks registered on it. config/celery.py's `config_from_object` call ran at
+    process start against the default (localhost) Redis URL, before `_redis_setup`/`celery_config`
+    pointed `settings.REDIS_URL` at the real test container — so the broker/result-backend are
+    re-applied here, after that fixture has run."""
+    # celery.contrib.testing.worker's start_worker() asserts `celery.ping` is registered before
+    # starting a real worker thread (celery_worker fixture, below). That task isn't a real
+    # celery builtin — it's a @shared_task defined in celery.contrib.testing.tasks, which
+    # celery.contrib.pytest's own default TestApp imports implicitly; a plain Celery() app (this
+    # one) only picks it up if that module is imported *before* the app finalizes, since
+    # @shared_task registers itself via an on-finalize hook rather than retroactively.
+    import celery.contrib.testing.tasks  # noqa: F401
+
+    from config.celery import app as real_app
+
+    real_app.conf.update(**celery_config)
+    real_app.finalize()
+    return real_app
+
+
 @pytest.fixture(autouse=True)
-def _reset_state(db: None) -> None:
-    """Depending on pytest-django's `db` fixture gives every test its own transaction against
-    the real Postgres container, rolled back afterward — that's what resets DB rows, the same
-    guarantee the FastAPI sibling gets from a manual per-test TRUNCATE, just automatic here.
+def _reset_state(transactional_db: None) -> None:
+    """`transactional_db` (not the plain `db` fixture M2/M3 used) commits each test's rows for
+    real and truncates between tests, rather than wrapping the test in a transaction that's
+    rolled back afterward. That rollback-based isolation is invisible across connections — a
+    real Celery worker thread (see test_dispatch.py's one true end-to-end test) opens its own DB
+    connection to pick up a task, and would never see a ride only visible inside the test's own
+    uncommitted transaction. Slightly slower than plain `db` (a real TRUNCATE beats an
+    in-memory rollback), acceptable for this test count.
 
     Everything else this app keeps process-local state in (the driver geo-index/availability
     set, the surge cache, both rate limiters) now lives in the same real Redis container, so one

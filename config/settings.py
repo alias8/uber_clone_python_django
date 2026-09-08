@@ -70,3 +70,23 @@ RIDE_REQUEST_LIMIT_PER_MINUTE = 5
 AUTH_ATTEMPTS_LIMIT_PER_15_MIN = 10
 
 REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
+
+KAFKA_BOOTSTRAP_SERVERS = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
+
+# --- Celery (M4): the async/background-work side of this project, see config/celery.py and
+# rides/tasks.py. Redis (already required from M3) doubles as the broker and result backend —
+# no reason to introduce a second broker technology just for task queuing.
+CELERY_BROKER_URL = REDIS_URL
+CELERY_RESULT_BACKEND = REDIS_URL
+CELERY_ACCEPT_CONTENT = ["json"]
+CELERY_TASK_SERIALIZER = "json"
+CELERY_RESULT_SERIALIZER = "json"
+CELERY_TIMEZONE = TIME_ZONE
+# The stale-ride retry job (StaleRideRetryJob.kt / the FastAPI sibling's asyncio-sleep loop) is
+# a Celery Beat periodic task here instead — same 60s interval.
+CELERY_BEAT_SCHEDULE = {
+    "retry-stale-rides": {
+        "task": "rides.retry_stale_rides",
+        "schedule": 60.0,
+    },
+}

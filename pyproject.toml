@@ -9,7 +9,11 @@ dependencies = [
     "pyjwt>=2.9",
     "bcrypt>=4.2",
     "psycopg[binary]>=3.2",
-    "redis>=5.0",
+    # celery[redis] (via kombu) caps this to <6.5 — kept unpinned here rather than forcing a
+    # newer redis-py that celery can't yet install alongside.
+    "redis>=5.0,<6.5",
+    "celery[redis]>=5.6.3",
+    "kafka-python-ng>=2.2",
 ]
 
 [project.optional-dependencies]
@@ -17,10 +21,17 @@ dev = [
     "mypy>=1.13",
     "django-stubs[compatible-mypy]>=5.1",
     "djangorestframework-stubs[compatible-mypy]>=3.15",
+    "celery-types>=0.22",
     "ruff>=0.7",
     "pytest>=8.3",
     "pytest-django>=4.9",
-    "testcontainers[postgres,redis]>=4.8",
+    # >=4.15 specifically: that's where testcontainers.community.{postgres,redis,kafka} (used by
+    # tests/conftest.py) live — older 4.13.x keeps those same containers at the top level instead.
+    # Deliberately NOT requesting testcontainers' own "redis" extra: that extra pins redis>=7,
+    # which conflicts with celery[redis]'s redis<6.5 pin. RedisContainer itself only needs
+    # whatever `redis` package this project already installs for its own client (rides/redis_client.py)
+    # to be present at all — it doesn't require a specific version.
+    "testcontainers[postgres,kafka]>=4.15",
 ]
 
 [build-system]
@@ -43,6 +54,12 @@ django_settings_module = "config.settings"
 # manage.py is a stock Django entrypoint script, not worth strict-typing.
 module = "manage"
 ignore_errors = true
+
+[[tool.mypy.overrides]]
+# kafka-python-ng ships no type stubs at all, same situation the FastAPI sibling documented for
+# aiokafka (see kafka_producer.py/kafka_bridge.py for the casts this makes necessary).
+module = "kafka.*"
+ignore_missing_imports = true
 
 [tool.ruff]
 line-length = 110

@@ -16,6 +16,8 @@ at its own M3 — see MILESTONE_NOTES.md).
 
 from __future__ import annotations
 
+from datetime import datetime
+
 from rides.dispatch import DRIVER_AVAILABLE_SET, DRIVER_GEO_KEY
 from rides.domain import Driver, Rating, Ride, RideStatus, Role, User
 from rides.models import DriverRow, RatingRow, RideRow, UserRow
@@ -178,6 +180,10 @@ class RideRepository:
 
     def find_by_driver_id_ordered(self, driver_id: str) -> list[Ride]:
         rows = RideRow.objects.filter(driver_id=driver_id).order_by("-requested_at")
+        return [_ride_from_row(r) for r in rows]
+
+    def find_by_status_and_requested_at_before(self, status: RideStatus, cutoff: datetime) -> list[Ride]:
+        rows = RideRow.objects.filter(status=status.value, requested_at__lt=cutoff)
         return [_ride_from_row(r) for r in rows]
 
     def count_pending_near(self, lat: float, lng: float, delta: float = 0.01) -> int:

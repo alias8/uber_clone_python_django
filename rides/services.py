@@ -1,8 +1,9 @@
 """Ride/driver/rating domain logic. Ported from RideService.kt, DriverService.kt and
 RatingService.kt (and cross-checked against the FastAPI sibling's services.py, which ported the
 same logic first). Fare calculation is in-process (rides.pricing) rather than a gRPC call — see
-pricing.py's docstring. Kafka event publishing (ride-requested/accepted/completed/cancelled) and
-the SSE/Channels location/offer streams are deferred to later milestones.
+pricing.py's docstring. Kafka event publishing (ride-requested/accepted/completed/cancelled) is
+wired in as of M4 (rides/kafka_producer.py) — see rides/tasks.py for what consumes those events.
+The SSE/Channels location/offer streams are still deferred, to M5.
 """
 
 from __future__ import annotations
@@ -16,6 +17,12 @@ from rest_framework.exceptions import APIException
 
 from rides.dispatch import NearbyDriver, find_nearby_available_drivers
 from rides.domain import Driver, Rating, Ride, RideStatus
+from rides.kafka_producer import (
+    publish_ride_accepted,
+    publish_ride_cancelled,
+    publish_ride_completed,
+    publish_ride_requested,
+)
 from rides.pricing import SURGE_SEARCH_RADIUS_KM, PricingService
 from rides.repositories import (
     ACTIVE_RIDE_STATUSES,
@@ -124,7 +131,7 @@ class RideService:
         )
         estimated_fare = self._calculate_fare(ride)
         saved = self._ride_repository.save(replace(ride, estimated_fare=estimated_fare))
-        # kafkaEventProducer.publishRideRequested(saved.id) — deferred until Celery lands.
+        publish_ride_requested(saved.id)
         return saved
 
     def get_ride(self, ride_id: str) -> Ride:
@@ -148,7 +155,7 @@ class RideService:
             saved = self._ride_repository.save(
                 replace(ride, driver_id=driver_id, status=RideStatus.MATCHED, version=ride.version + 1)
             )
-            # kafkaEventProducer.publishRideAccepted(saved.id) — deferred until Celery lands.
+            publish_ride_accepted(saved.id)
             return saved
 
     def start_ride(self, ride_id: str, driver_id: str) -> Ride:
@@ -178,7 +185,7 @@ class RideService:
             )
         )
         self._driver_service.mark_available_by_id(driver_id)
-        # kafkaEventProducer.publishRideCompleted(saved.id) — deferred until Celery lands.
+        publish_ride_completed(saved.id)
         return saved
 
     def cancel_ride(self, ride_id: str, user_id: str) -> Ride:
@@ -194,7 +201,7 @@ class RideService:
         saved = self._ride_repository.save(
             replace(ride, status=RideStatus.CANCELLED, version=ride.version + 1)
         )
-        # kafkaEventProducer.publishRideCancelled(saved.id) — deferred until Celery lands.
+        publish_ride_cancelled(saved.id)
         return saved
 
     # Calls the in-process pricing module rather than a separate gRPC pricing-service — the
