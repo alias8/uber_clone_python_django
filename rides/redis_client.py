@@ -23,7 +23,7 @@ _client: redis.Redis | None = None
 _client_url: str | None = None
 
 
-def get_client() -> redis.Redis:
+def get_redis_client() -> redis.Redis:
     global _client, _client_url
     url = settings.REDIS_URL
     if _client is None or _client_url != url:

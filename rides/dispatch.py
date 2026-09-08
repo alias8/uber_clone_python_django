@@ -25,7 +25,7 @@ from typing import cast
 
 from rides.domain import Ride
 from rides.geo import eta_minutes
-from rides.redis_client import get_client
+from rides.redis_client import get_redis_client
 from rides.streaming.groups import driver_offers_group, send_event
 
 DRIVER_GEO_KEY = "drivers:locations"
@@ -46,11 +46,11 @@ class NearbyDriver:
 def find_nearby_available_drivers(
     lat: float, lng: float, radius_km: float = DEFAULT_SEARCH_RADIUS_KM
 ) -> list[NearbyDriver]:
-    client = get_client()
+    redis_client = get_redis_client()
     # withdist=True guarantees each result is a (member, distance) pair, not a bare member name.
     results = cast(
         "list[tuple[str, float]]",
-        client.geosearch(
+        redis_client.geosearch(
             DRIVER_GEO_KEY,
             longitude=lng,
             latitude=lat,
@@ -67,7 +67,7 @@ def find_nearby_available_drivers(
     # results is [(driver_id, distance_km), ...]; available is [1, 0, 1, ...] from smismember,
     # same order/length as results.
     driver_ids = [driver_id for driver_id, _distance_km in results]
-    available = cast("list[int]", client.smismember(DRIVER_AVAILABLE_SET, driver_ids))
+    available = cast("list[int]", redis_client.smismember(DRIVER_AVAILABLE_SET, driver_ids))
     return [
         NearbyDriver(driver_id=driver_id, distance_km=float(distance_km))
         for (driver_id, distance_km), is_available in zip(results, available, strict=True)
@@ -83,10 +83,10 @@ def fanout_to_nearby_drivers(ride: Ride) -> None:
     if not nearby:
         return
 
-    client = get_client()
+    redis_client = get_redis_client()
     dispatched_key = f"{DISPATCHED_KEY_PREFIX}{ride.id}"
-    client.sadd(dispatched_key, *(driver.driver_id for driver in nearby))
-    client.expire(dispatched_key, DISPATCHED_TTL_SECONDS)
+    redis_client.sadd(dispatched_key, *(driver.driver_id for driver in nearby))
+    redis_client.expire(dispatched_key, DISPATCHED_TTL_SECONDS)
 
     for driver in nearby:
         # camelCase keys: this is a wire format for the browser client (an SSE `data:` payload
@@ -110,7 +110,7 @@ def get_driver_location(driver_id: str) -> tuple[float, float] | None:
     """Ported from DriverService.kt::getDriverLocation (cross-checked against the FastAPI
     sibling's own port of it). Returns (lat, lng) — GEOPOS itself returns (lon, lat), Redis's own
     convention; this flips it to match the rest of this codebase."""
-    positions = cast("list[tuple[float, float] | None]", get_client().geopos(DRIVER_GEO_KEY, driver_id))
+    positions = cast("list[tuple[float, float] | None]", get_redis_client().geopos(DRIVER_GEO_KEY, driver_id))
     position = positions[0]
     if position is None:
         return None
@@ -124,11 +124,11 @@ def notify_offer_cancelled_and_clear(ride_id: str, accepted_driver_id: str | Non
     Channels group, then the dispatched-drivers bookkeeping set is cleared. Unlike M4's
     `clear_dispatch` (which only did the second half — Channels group delivery didn't exist yet),
     this reads the set *before* deleting it, same order as the ported Kotlin/FastAPI handlers."""
-    client = get_client()
+    redis_client = get_redis_client()
     dispatched_key = f"{DISPATCHED_KEY_PREFIX}{ride_id}"
-    dispatched_drivers = cast("set[str]", client.smembers(dispatched_key))
+    dispatched_drivers = cast("set[str]", redis_client.smembers(dispatched_key))
     payload = json.dumps({"rideId": ride_id})
     for driver_id in dispatched_drivers:
         if driver_id != accepted_driver_id:
             send_event(driver_offers_group(driver_id), "offer.cancelled", payload)
-    client.delete(dispatched_key)
+    redis_client.delete(dispatched_key)

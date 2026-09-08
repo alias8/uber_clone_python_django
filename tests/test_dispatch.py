@@ -26,7 +26,7 @@ from rest_framework.test import APIClient
 from rides import kafka_bridge, kafka_producer, tasks
 from rides.dispatch import DISPATCHED_KEY_PREFIX, DISPATCHED_TTL_SECONDS, fanout_to_nearby_drivers
 from rides.domain import Ride
-from rides.redis_client import get_client
+from rides.redis_client import get_redis_client
 from rides.state import ride_repository
 from rides.streaming.groups import driver_offers_group, ride_location_group
 from rides.tasks import RETRY_CUTOFF
@@ -66,7 +66,7 @@ def test_fanout_writes_dispatched_set_with_ttl_and_sends_offer_via_channel_layer
     )
     fanout_to_nearby_drivers(ride)
 
-    redis_client = get_client()
+    redis_client = get_redis_client()
     dispatched_key = f"{DISPATCHED_KEY_PREFIX}{ride.id}"
     assert redis_client.smembers(dispatched_key) == {alice_id}
     ttl = cast("int", redis_client.ttl(dispatched_key))
@@ -96,7 +96,7 @@ def test_fanout_with_no_nearby_drivers_writes_nothing() -> None:
         dropoff_lng=RIDE_REQUEST["dropoff_lng"],
     )
     fanout_to_nearby_drivers(ride)
-    assert get_client().exists(f"{DISPATCHED_KEY_PREFIX}{ride.id}") == 0
+    assert get_redis_client().exists(f"{DISPATCHED_KEY_PREFIX}{ride.id}") == 0
 
 
 def test_handle_ride_requested_dispatches_when_still_requested(client: APIClient) -> None:
@@ -110,7 +110,7 @@ def test_handle_ride_requested_dispatches_when_still_requested(client: APIClient
 
     tasks.handle_ride_requested(ride_id)
 
-    assert get_client().smembers(f"{DISPATCHED_KEY_PREFIX}{ride_id}") == {driver_id}
+    assert get_redis_client().smembers(f"{DISPATCHED_KEY_PREFIX}{ride_id}") == {driver_id}
 
 
 def test_handle_ride_requested_skips_a_ride_that_is_no_longer_requested(client: APIClient) -> None:
@@ -120,7 +120,7 @@ def test_handle_ride_requested_skips_a_ride_that_is_no_longer_requested(client: 
 
     tasks.handle_ride_requested(ride_id)
 
-    assert get_client().exists(f"{DISPATCHED_KEY_PREFIX}{ride_id}") == 0
+    assert get_redis_client().exists(f"{DISPATCHED_KEY_PREFIX}{ride_id}") == 0
 
 
 def test_handle_ride_accepted_clears_dispatched_set_and_notifies_the_other_driver(
@@ -146,7 +146,7 @@ def test_handle_ride_accepted_clears_dispatched_set_and_notifies_the_other_drive
 
     tasks.handle_ride_requested(ride_id)
     dispatched_key = f"{DISPATCHED_KEY_PREFIX}{ride_id}"
-    assert get_client().smembers(dispatched_key) == {accepted_driver_id, other_driver_id}
+    assert get_redis_client().smembers(dispatched_key) == {accepted_driver_id, other_driver_id}
 
     # other_driver is nearby and available too, so it gets its own ride.offer from the fanout
     # above, same as accepted_driver did — drain that first before the offer.cancelled this test
@@ -156,7 +156,7 @@ def test_handle_ride_accepted_clears_dispatched_set_and_notifies_the_other_drive
 
     accepted_driver.post(f"/rides/{ride_id}/accept")
     tasks.handle_ride_accepted(ride_id)
-    assert get_client().exists(dispatched_key) == 0
+    assert get_redis_client().exists(dispatched_key) == 0
 
     message = async_to_sync(channel_layer.receive)(other_channel)
     assert message["type"] == "offer.cancelled"
@@ -257,7 +257,7 @@ def test_ride_request_is_dispatched_end_to_end_through_kafka_and_celery(
         ride_id = rider.post("/rides", RIDE_REQUEST, format="json").data["id"]
 
         dispatched_key = f"{DISPATCHED_KEY_PREFIX}{ride_id}"
-        redis_client = get_client()
+        redis_client = get_redis_client()
         deadline = time.monotonic() + 15
         while time.monotonic() < deadline:
             if redis_client.exists(dispatched_key):

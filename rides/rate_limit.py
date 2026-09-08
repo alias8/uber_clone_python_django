@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from typing import cast
 
-from rides.redis_client import get_client
+from rides.redis_client import get_redis_client
 
 
 class RateLimiter:
@@ -29,12 +29,12 @@ class RateLimiter:
 
     def allow(self, key: str) -> bool:
         redis_key = f"{self._key_prefix}{key}"
-        client = get_client()
+        redis_client = get_redis_client()
         # redis-py's `incr()` stub returns a union that includes Awaitable[Any] (its sync/async
         # client classes share overload signatures) even though this project only ever uses the
         # synchronous client — same kind of targeted cast pricing.py's SurgeCache already needed
         # for `get()`, see claude.md.
-        count = cast("int", client.incr(redis_key))
+        count = cast("int", redis_client.incr(redis_key))
         if count == 1:
-            client.expire(redis_key, self._window_seconds)
+            redis_client.expire(redis_key, self._window_seconds)
         return bool(count <= self._capacity)

@@ -16,7 +16,7 @@ from decimal import ROUND_HALF_UP, Decimal
 from typing import cast
 
 from rides.geo import haversine_km
-from rides.redis_client import get_client
+from rides.redis_client import get_redis_client
 
 BASE_FARE = Decimal("2.00")
 PER_KM_RATE = Decimal("1.50")
@@ -59,11 +59,11 @@ class SurgeCache:
         # redis-py types GET's return as bytes | str | None regardless of decode_responses; the
         # client is constructed with decode_responses=True (see redis_client.py), so this is
         # always a str at runtime.
-        value = cast("str | None", get_client().get(key))
+        value = cast("str | None", get_redis_client().get(key))
         return Decimal(value) if value is not None else None
 
     def set(self, key: str, value: Decimal, ttl_seconds: int = SURGE_TTL_SECONDS) -> None:
-        get_client().set(key, str(value), ex=ttl_seconds)
+        get_redis_client().set(key, str(value), ex=ttl_seconds)
 
 
 class PricingService:

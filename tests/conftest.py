@@ -9,7 +9,7 @@ from testcontainers.community.kafka import KafkaContainer
 from testcontainers.community.postgres import PostgresContainer
 from testcontainers.community.redis import RedisContainer
 
-from rides.redis_client import get_client
+from rides.redis_client import get_redis_client
 
 # celery ships celery.contrib.pytest (celery_app/celery_config/celery_worker fixtures) but
 # doesn't register it as a pytest11 entry point in this version — it has to be opted into
@@ -56,10 +56,10 @@ def django_db_setup(django_db_blocker: DjangoDbBlocker | None) -> Iterator[None]
 @pytest.fixture(scope="session", autouse=True)
 def _redis_setup() -> Iterator[None]:
     """Points `settings.REDIS_URL` at a throwaway Redis container for the whole test session —
-    same idea as `django_db_setup` above, but simpler: `redis_client.get_client()` re-reads
+    same idea as `django_db_setup` above, but simpler: `redis_client.get_redis_client()` re-reads
     `settings.REDIS_URL` on every call and only rebuilds its cached client when the value
     changes, so a plain reassignment here (not an in-place mutation, unlike the DATABASES dict)
-    is enough to take effect before anything calls `get_client()` for the first time.
+    is enough to take effect before anything calls `get_redis_client()` for the first time.
 
     Also repoints `settings.CHANNEL_LAYERS["default"]["CONFIG"]["hosts"]` (M5) at the same
     container — `channels.layers.get_channel_layer()` lazily builds and caches its backend from
@@ -79,7 +79,7 @@ def _redis_setup() -> Iterator[None]:
 def _kafka_setup() -> Iterator[None]:
     """Points `settings.KAFKA_BOOTSTRAP_SERVERS` at a throwaway Kafka broker for the whole test
     session — same idea as `_redis_setup` above. `kafka_producer.get_producer()` re-reads
-    `settings.KAFKA_BOOTSTRAP_SERVERS` on every call the same way `redis_client.get_client()`
+    `settings.KAFKA_BOOTSTRAP_SERVERS` on every call the same way `redis_client.get_redis_client()`
     re-reads `settings.REDIS_URL`, so a plain reassignment here is enough.
 
     Uses the confluentinc/cp-kafka image's default startup wait; that's taken ~30-40s locally
@@ -141,7 +141,7 @@ def _reset_state(transactional_db: None) -> None:
     `FLUSHDB` clears all of it at once — same approach the FastAPI sibling's own conftest.py
     uses, and the reason none of those classes has a `.clear()` method anymore (see
     MILESTONE_NOTES.md's M3 entry)."""
-    get_client().flushdb()
+    get_redis_client().flushdb()
 
 
 @pytest.fixture

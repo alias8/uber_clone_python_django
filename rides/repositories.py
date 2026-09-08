@@ -21,7 +21,7 @@ from datetime import datetime
 from rides.dispatch import DRIVER_AVAILABLE_SET, DRIVER_GEO_KEY
 from rides.domain import Driver, Rating, Ride, RideStatus, Role, User
 from rides.models import DriverRow, RatingRow, RideRow, UserRow
-from rides.redis_client import get_client
+from rides.redis_client import get_redis_client
 
 ACTIVE_RIDE_STATUSES = (RideStatus.REQUESTED, RideStatus.MATCHED, RideStatus.IN_PROGRESS)
 
@@ -122,7 +122,7 @@ class DriverRepository:
 
         # Dual write, same as DriverService.kt: Postgres owns is_available; the availability set
         # is the fast-path Redis mirror dispatch.py filters against. Never touches the geo-index.
-        redis_client = get_client()
+        redis_client = get_redis_client()
         if driver.is_available:
             redis_client.sadd(DRIVER_AVAILABLE_SET, driver.user_id)
         else:
@@ -131,10 +131,10 @@ class DriverRepository:
         return self._driver_from_row(row)
 
     def set_location(self, user_id: str, lat: float, lng: float) -> None:
-        get_client().geoadd(DRIVER_GEO_KEY, [lng, lat, user_id])
+        get_redis_client().geoadd(DRIVER_GEO_KEY, [lng, lat, user_id])
 
     def clear_location(self, user_id: str) -> None:
-        get_client().zrem(DRIVER_GEO_KEY, user_id)
+        get_redis_client().zrem(DRIVER_GEO_KEY, user_id)
 
     def find_by_id(self, user_id: str) -> Driver | None:
         row = DriverRow.objects.filter(user_id=user_id).first()
