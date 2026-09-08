@@ -7,11 +7,14 @@ deprecated `GEORADIUS` command; this uses its `GEOSEARCH` successor instead, the
 FastAPI sibling made. Both keys are written by repositories.py's `DriverRepository.save()`/
 `set_location()`/`clear_location()` — this module only reads them.
 
-fanout_to_nearby_drivers and clear_dispatch port `DispatchService.kt`'s fan-out and the
-non-SSE half of `KafkaConsumer.kt`'s ride-accepted handler, called from `rides/tasks.py`'s Celery
-tasks (M4) rather than an asyncio consumer loop. Actually delivering the published offer to a
-driver (Django Channels reading `ride_offers:{driverId}`) is M5's job — this module only writes
-to Redis, it doesn't care who's listening yet.
+fanout_to_nearby_drivers, notify_offer_cancelled, and get_driver_location port
+`DispatchService.kt`'s fan-out and `KafkaConsumer.kt`'s ride-accepted handler (both halves now —
+M5 fills in the SSE-equivalent delivery M4 deferred), called from `rides/tasks.py`'s Celery tasks
+rather than an asyncio consumer loop. Delivery itself goes through `rides.streaming.groups`
+(Channels group_send, M5) rather than the raw Redis pub/sub channel this module used as a
+placeholder through M4 — see that module's docstring for why. The `dispatched:{rideId}` Redis set
+is still real Redis bookkeeping (who was offered this ride), not a delivery mechanism, so it's
+unchanged.
 """
 
 from __future__ import annotations
@@ -23,10 +26,10 @@ from typing import cast
 from rides.domain import Ride
 from rides.geo import eta_minutes
 from rides.redis_client import get_client
+from rides.streaming.groups import driver_offers_group, send_event
 
 DRIVER_GEO_KEY = "drivers:locations"
 DRIVER_AVAILABLE_SET = "drivers:available"
-RIDE_OFFER_CHANNEL_PREFIX = "ride_offers:"
 DISPATCHED_KEY_PREFIX = "dispatched:"
 DISPATCHED_TTL_SECONDS = 5 * 60
 
@@ -75,7 +78,7 @@ def find_nearby_available_drivers(
 def fanout_to_nearby_drivers(ride: Ride) -> None:
     """Ports DispatchService.kt::fanoutToNearbyDrivers, called from rides/tasks.py's
     handle_ride_requested. Records who was offered the ride (`dispatched:{rideId}`, 5-minute TTL)
-    and publishes a ride-offer payload to each nearby available driver's own pub/sub channel."""
+    and sends a `ride.offer` event to each nearby available driver's own Channels group."""
     nearby = find_nearby_available_drivers(ride.pickup_lat, ride.pickup_lng, DEFAULT_SEARCH_RADIUS_KM)
     if not nearby:
         return
@@ -86,8 +89,9 @@ def fanout_to_nearby_drivers(ride: Ride) -> None:
     client.expire(dispatched_key, DISPATCHED_TTL_SECONDS)
 
     for driver in nearby:
-        # camelCase keys: this is a wire format for whatever eventually subscribes to it (M5's
-        # Channels layer), not internal Python state — matching Kotlin's JSON payload exactly.
+        # camelCase keys: this is a wire format for the browser client (an SSE `data:` payload
+        # via rides/streaming/consumers.py), not internal Python state — matching Kotlin's JSON
+        # payload exactly.
         payload = json.dumps(
             {
                 "rideId": ride.id,
@@ -99,16 +103,32 @@ def fanout_to_nearby_drivers(ride: Ride) -> None:
                 "etaMinutes": eta_minutes(driver.distance_km),
             }
         )
-        client.publish(f"{RIDE_OFFER_CHANNEL_PREFIX}{driver.driver_id}", payload)
+        send_event(driver_offers_group(driver.driver_id), "ride.offer", payload)
 
 
-def clear_dispatch(ride_id: str) -> None:
-    """Ports the state-cleanup half of KafkaConsumer.kt's ride-accepted handler: clears the
-    dispatched-drivers key now that the ride has a driver. In the Kotlin/FastAPI single-process
-    design, the *same* handler also directly emits `offer_cancelled`/`driver_eta_to_pickup` SSE
-    events to the other dispatched drivers and the rider — pure in-process delivery, no Redis
-    involved. This project's Celery worker (this module) and its Channels layer (M5) are
-    separate processes, so there's no in-process registry to call here; notifying other drivers
-    their offer is gone is deferred to M5, which will own how cross-process delivery works
-    rather than this task guessing at a wire format for it now."""
-    get_client().delete(f"{DISPATCHED_KEY_PREFIX}{ride_id}")
+def get_driver_location(driver_id: str) -> tuple[float, float] | None:
+    """Ported from DriverService.kt::getDriverLocation (cross-checked against the FastAPI
+    sibling's own port of it). Returns (lat, lng) — GEOPOS itself returns (lon, lat), Redis's own
+    convention; this flips it to match the rest of this codebase."""
+    positions = cast("list[tuple[float, float] | None]", get_client().geopos(DRIVER_GEO_KEY, driver_id))
+    position = positions[0]
+    if position is None:
+        return None
+    lng, lat = position
+    return lat, lng
+
+
+def notify_offer_cancelled_and_clear(ride_id: str, accepted_driver_id: str | None) -> None:
+    """Ports the notification half of KafkaConsumer.kt's ride-accepted handler: every driver who
+    was offered this ride but didn't accept it gets an `offer.cancelled` event on their own
+    Channels group, then the dispatched-drivers bookkeeping set is cleared. Unlike M4's
+    `clear_dispatch` (which only did the second half — Channels group delivery didn't exist yet),
+    this reads the set *before* deleting it, same order as the ported Kotlin/FastAPI handlers."""
+    client = get_client()
+    dispatched_key = f"{DISPATCHED_KEY_PREFIX}{ride_id}"
+    dispatched_drivers = cast("set[str]", client.smembers(dispatched_key))
+    payload = json.dumps({"rideId": ride_id})
+    for driver_id in dispatched_drivers:
+        if driver_id != accepted_driver_id:
+            send_event(driver_offers_group(driver_id), "offer.cancelled", payload)
+    client.delete(dispatched_key)

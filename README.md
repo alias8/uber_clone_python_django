@@ -51,8 +51,18 @@ rides/                  The one Django app this domain lives in
   kafka_producer.py         Publishes ride-requested/accepted/completed/cancelled (M4)
   kafka_bridge.py           Kafka-to-Celery bridge: reads Kafka, enqueues a Celery task per
                             message — see "Celery" below for why this is a separate module
-  tasks.py                  Celery tasks: the four ride-event handlers + the stale-ride retry
-                            periodic task (M4)
+  tasks.py                  Celery tasks: the four ride-event handlers (now including the M5
+                            Channels group_send delivery M4 deferred) + the stale-ride retry
+                            periodic task
+  streaming/
+    groups.py                 Channel-layer group naming + a group_send/close helper, callable
+                               from both Celery tasks and in-process view code (M5)
+    auth.py                    ASGI-scope JWT/cookie auth extraction — the Channels-consumer
+                                equivalent of auth/authentication.py, since a raw ASGI scope
+                                isn't a DRF Request
+    consumers.py                DriverOffersConsumer / RideLocationConsumer — see "Streaming"
+                                 below for why these override __call__ instead of using
+                                 AsyncHttpConsumer's default per-event-type dispatch
   management/commands/
     consume_kafka.py          Runs kafka_bridge.consume_forever() as its own process
   services.py              DriverService / RideService / RatingService — the domain logic
@@ -154,13 +164,82 @@ Running the full pipeline locally needs four processes: `python manage.py runser
 and result backend — no second broker technology introduced just for task queuing. Configure
 Kafka via the `KAFKA_BOOTSTRAP_SERVERS` env var (default: `localhost:9092`).
 
-One consequence of the process split worth naming: in the Kotlin/FastAPI single-process design,
-the ride-accepted handler directly notifies other dispatched drivers their offer is gone via an
-in-process SSE emit — no Redis involved, since the handler and the SSE registry share a process.
-Here, the Celery worker (this milestone) and the Channels layer (M5) are separate processes by
-design, so there's no in-process registry to call from `dispatch.py::clear_dispatch()`. That
-notification is deferred to M5, which will own the actual cross-process delivery mechanism
-rather than this milestone guessing at one.
+The Celery worker (this milestone) and the Channels layer serving SSE connections (M5, its own
+Daphne/ASGI process) are separate processes by design — see "Streaming" below for how a driver
+notification produced in the worker reaches a browser connection held open in a different process
+with no bridge process needed, unlike the Kafka side above.
+
+## Streaming (Channels, M5)
+
+Two real-time streams, same client contract as the other two repos: a driver's ride-offer stream
+(`GET /driver/offers`) and a rider's ride-location stream (`GET /rides/{id}/location`), both
+**genuine SSE-over-HTTP**, not WebSocket. That's a deliberate choice — Channels can do either, and
+a WebSocket consumer is arguably the more idiomatic default reach for real-time delivery, but it
+changes the client contract (bidirectional, no native `EventSource`, different reconnection
+semantics) for no behavioral gain here: both streams are server → client only. Keeping them SSE
+means the wire format (`event: <name>\ndata: <payload>\n\n`) and event names (`ride_offer`,
+`offer_cancelled`, `driver_location`, `driver_eta_to_pickup`) are identical to `uber_clone`'s
+`SseEmitter` output and the FastAPI sibling's `StreamingResponse` output — genuinely swappable
+from a client's point of view, which matters for a project explicitly built to be compared
+line-for-line against those two.
+
+**Delivery: Channels group_send, not a Redis pub/sub bridge.** M4 wrote to a placeholder Redis
+pub/sub channel (`ride_offers:{driverId}`) with nothing consuming it yet. Both Kotlin
+(`RideOfferListener.kt`) and the FastAPI sibling (`ride_offer_listener.py`) need a bridge process
+subscribing to that channel and forwarding into their own in-process registry, because neither
+`SseEmitter` nor an `asyncio.Queue` has any cross-process delivery mechanism of its own. Channels'
+own channel layer (`channels_redis`, already backed by the same Redis this project requires from
+M3) *is* cross-process — so `rides/dispatch.py`'s fan-out and `rides/tasks.py`'s ride-accepted
+handler call `rides/streaming/groups.py::send_event()`/`send_close()` directly (via
+`asgiref.sync.async_to_sync`, Channels' documented pattern for driving an async channel layer from
+sync code), reaching a driver's SSE connection in the Daphne process with no bridge process in
+between. `rides/services.py`'s `update_location`/`go_offline` call the same helpers directly
+in-process, since those run inside the Daphne process already (a synchronous DRF view, not a
+Celery task) — the one event produced in-process rather than from a Celery task.
+
+**Why the consumers override `__call__` instead of using `AsyncHttpConsumer`'s default dispatch.**
+The first design tried here defined `ride_offer()`/`offer_cancelled()`/etc. handler methods on the
+consumer, the same pattern a WebSocket consumer uses for group messages — Channels' base
+`AsyncConsumer.__call__` already polls both the ASGI `receive` callable and
+`self.channel_layer.receive(self.channel_name)` concurrently, dispatching whichever arrives to a
+`<type>`-named method. That works for WebSocket consumers because `connect()`/`receive()`/each
+handler all return quickly. It does not work for `AsyncHttpConsumer`: `handle()` is meant to run
+once and keep the response open itself (there's no "return now, get called again later" for this
+consumer type — returning from `handle()` unconditionally ends the connection), so a long-lived
+`handle()` blocks the *entire* outer dispatch loop for as long as it runs — starving that
+loop's *own* automatically-polled channel-layer task, which is still concurrently racing to pop
+from the exact same per-channel queue this module needs to read from itself. Messages would
+occasionally be silently stolen by a dispatch call with no matching handler method, crashing the
+connection. `rides/streaming/consumers.py::_SseStreamConsumer` overrides `__call__` to skip that
+outer loop entirely and has `handle()` run its own `asyncio.wait(..., FIRST_COMPLETED)` loop,
+directly and exclusively multiplexing the ASGI receive callable (to notice a client disconnect)
+against the channel-layer receive (to notice a group-sent event or a server-initiated
+`stream.close`) — see that module's docstring for the full reasoning. `AsyncHttpConsumer` is kept
+as the base purely for its `send_headers`/`send_body` helper methods.
+
+**Guard order matches the other two repos exactly**: role, ownership, and ride-status checks run
+— and can reject with a plain, non-streaming HTTP response (401/403/404/409) — *before*
+`send_headers()` ever opens the event-stream response, mirroring `@PreAuthorize` +
+`ResponseStatusException` firing before an `SseEmitter`/`StreamingResponse` is ever constructed.
+
+**Testing a live stream, for real.** The Kotlin original has zero tests for this (its own README
+says so). The FastAPI sibling's `TestClient` buffers a whole response before returning control, so
+it can't read a live, open-ended stream at all — its `test_sse.py` can only test the registry and
+each call site directly. `channels.testing.ApplicationCommunicator` has no such limitation: it
+gives full control over the ASGI message flow, so `tests/test_streaming.py` drives a real consumer
+instance through connect → receive a **real Channels-group-sent event** (round-tripped through the
+real Redis-backed channel layer, same as production) → disconnect, end to end, with no stand-in
+for any of the streaming machinery. It also covers the server-initiated `stream.close` path (a
+completed ride's location stream ending itself) and the guard-rejection paths.
+
+Manually verified against a real running `daphne` process (plus a real Postgres and Redis; Kafka
+was out of the loop for this particular manual pass — see "Manual verification" note in
+`MILESTONE_NOTES.md`'s M5 entry for the honest scope of that): a `curl -N` on `/driver/offers`
+received a real `ride_offer` event fanned out from a separate process; a `curl -N` on
+`/rides/{id}/location` received a real `driver_location` event after `POST /driver/location`, then
+the connection closed on its own the moment the ride was marked completed; `POST /driver/mode/off`
+closed an open `/driver/offers` connection immediately; unauthenticated requests to both endpoints
+got a plain 401, not a hung connection.
 
 ## Ported faithfully vs. reimplemented
 
@@ -241,14 +320,25 @@ Genuinely reimplemented, where idiomatic Django/DRF differs enough to be worth n
 - **`djangorestframework-stubs`' `Serializer.__init__` many=True gap, and `redis-py`'s
   imprecise-or-absent stubs, keep needing the same targeted-cast treatment** (see "Accepted
   mypy-strict exceptions" in `claude.md`) — `rate_limit.py`'s `RateLimiter.allow()` needed one for
-  `incr()` this milestone (same class of gap as `pricing.py`'s existing `get()` cast), and
-  `tests/test_dispatch.py`'s pub/sub test needed `# type: ignore[no-untyped-call]` for
-  `pubsub()`/`subscribe()`, which have no stub signature at all rather than just an imprecise one.
+  `incr()` in M4 (same class of gap as `pricing.py`'s existing `get()` cast).
+- **Neither `channels` nor `channels_redis` ships stubs or a `py.typed` marker** (M5) — same
+  `ignore_missing_imports` treatment as `kafka.*`, see `claude.md`. Subclassing `AsyncHttpConsumer`
+  (an `Any`-typed base under that override) needs one targeted `# type: ignore[misc]` on the class
+  line; `channels.db.database_sync_to_async` needs the same on each decorated test-helper function.
+- **`channels.generic.http.AsyncHttpConsumer`'s per-event-type dispatch doesn't fit a long-lived
+  SSE stream** — see "Streaming" above for the full reasoning; `_SseStreamConsumer` overrides
+  `__call__` and runs its own concurrent-receive loop in `handle()` instead.
+- **Redis pub/sub bridge → Channels `group_send`.** M4's placeholder `ride_offers:{driverId}`
+  Redis pub/sub channel is gone as of M5 — `rides/streaming/groups.py`'s `send_event()`/
+  `send_close()` call `channel_layer.group_send()` directly, reaching a different process (a
+  driver's SSE connection in the Daphne process, from a Celery worker) with no bridge process,
+  unlike `RideOfferListener.kt`/the FastAPI sibling's `ride_offer_listener.py`, both of which need
+  one because their in-process registries have no cross-process delivery mechanism of their own.
 
 ## Running it
 
 Postgres, Redis, and Kafka must all be running (a local install or containers) before any of
-this. Four processes make up the full pipeline as of M4:
+this. Five processes make up the full pipeline as of M5:
 
 ```
 python3 -m venv .venv && source .venv/bin/activate
@@ -257,7 +347,10 @@ pip install -e ".[dev]"
 python manage.py migrate   # applies rides' own 3 migrations plus Django's stock auth/
                             # contenttypes tables
 
-python manage.py runserver              # HTTP API
+daphne config.asgi:application          # HTTP API + the two SSE streams (NOT manage.py
+                                         # runserver's WSGI dev server — see "Streaming" above;
+                                         # "daphne" in INSTALLED_APPS makes runserver itself use
+                                         # this automatically too, if you'd rather use that)
 celery -A config worker -l info         # runs rides/tasks.py's ride-event handlers
 celery -A config beat -l info           # schedules rides.retry_stale_rides every 60s
 python manage.py consume_kafka          # bridges Kafka -> Celery, see "Celery" above
@@ -277,23 +370,22 @@ All three run in CI on every push/PR (`.github/workflows/ci.yml`).
 
 ## Status
 
-Milestones 1-4 done: Django/DRF skeleton, JWT-cookie auth with the dual-role design, the full
-ride state machine, in-process fare/surge quoting, real Postgres persistence via the Django ORM,
-real Redis backing driver dispatch/surge caching/rate limiting, and now a real Kafka-driven
-dispatch pipeline plus the stale-ride retry job — running through Celery and a dedicated
-Kafka-to-Celery bridge process rather than an asyncio consumer loop (see "Celery" above for why).
-All covered by tests against real Postgres, Redis, and Kafka (testcontainers) — including one
-true end-to-end test exercising the real broker and a real Celery worker, not just direct task
-calls — `mypy --strict` and `pytest` clean. Also manually verified against real local
-Postgres/Redis/Kafka: all four processes running together, a full ride lifecycle
-(register → driver online → request → accept → start → complete → rate) dispatched and
-completed correctly, and Celery Beat's scheduler log confirmed firing `retry-stale-rides` on its
-60-second interval. Not yet built:
+Milestones 1-5 done: Django/DRF skeleton, JWT-cookie auth with the dual-role design, the full ride
+state machine, in-process fare/surge quoting, real Postgres persistence via the Django ORM, real
+Redis backing driver dispatch/surge caching/rate limiting, a real Kafka-driven dispatch pipeline
+running through Celery and a dedicated Kafka-to-Celery bridge process (see "Celery" above), and now
+real-time delivery of both SSE streams via Django Channels (see "Streaming" above) — including the
+offer-cancelled-to-other-drivers notification M4 deferred. All covered by tests against real
+Postgres, Redis, and Kafka (testcontainers) plus a real Redis-backed Channels layer — including one
+true end-to-end test exercising a real Kafka broker and a real Celery worker, and a real live SSE
+stream driven through `channels.testing.ApplicationCommunicator` end to end, not just direct
+function calls or a registry tested in isolation — `mypy --strict` and `pytest` (70 tests) clean.
 
-- **Milestone 5** — Django Channels: the SSE-equivalent endpoints
-  (`/rides/{id}/location`, `/driver/offers`) as WebSocket or SSE-over-ASGI consumers, including
-  the offer-cancelled-to-other-drivers notification `dispatch.py::clear_dispatch()` currently
-  defers (see "Celery" above)
-
-Milestones 6 (Docker/CI against real infra) and 7 (porting the AWS deployment doc) are out of
-scope for this project — cancelled by James rather than deferred.
+Also manually verified against a real running `daphne` process plus real Postgres and Redis (see
+"Streaming" above for exactly what that covered, and its one honest scope note: Kafka wasn't in
+the loop for that particular manual pass, since standing up a throwaway single-node Kafka broker
+by hand didn't work cleanly in the time available — the dispatch/notify functions it would have
+fed are exercised directly instead, and the full Kafka → Celery → dispatch path already has its
+own real-broker coverage from M4's manual verification and this milestone's automated end-to-end
+test). This project's milestone plan ends here — **milestones 6 (Docker/CI against real infra) and
+7 (porting the AWS deployment doc) were explicitly cancelled by James**, not deferred.

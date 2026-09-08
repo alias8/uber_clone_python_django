@@ -3,11 +3,14 @@ RatingService.kt (and cross-checked against the FastAPI sibling's services.py, w
 same logic first). Fare calculation is in-process (rides.pricing) rather than a gRPC call — see
 pricing.py's docstring. Kafka event publishing (ride-requested/accepted/completed/cancelled) is
 wired in as of M4 (rides/kafka_producer.py) — see rides/tasks.py for what consumes those events.
-The SSE/Channels location/offer streams are still deferred, to M5.
+`DriverService.update_location`/`go_offline` are the two streaming events produced in-process
+(this code runs inside the Daphne/ASGI process itself, not a Celery worker) rather than via
+rides/tasks.py — see rides/streaming/groups.py for the Channels group_send helpers used here.
 """
 
 from __future__ import annotations
 
+import json
 import threading
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -17,6 +20,7 @@ from rest_framework.exceptions import APIException
 
 from rides.dispatch import NearbyDriver, find_nearby_available_drivers
 from rides.domain import Driver, Rating, Ride, RideStatus
+from rides.geo import eta_minutes, haversine_km
 from rides.kafka_producer import (
     publish_ride_accepted,
     publish_ride_cancelled,
@@ -31,6 +35,7 @@ from rides.repositories import (
     RideRepository,
     UserRepository,
 )
+from rides.streaming.groups import driver_offers_group, ride_location_group, send_close, send_event
 
 
 class DomainError(APIException):
@@ -48,9 +53,13 @@ class DomainError(APIException):
         super().__init__(detail)
 
 
+_ACTIVE_RIDE_STATUSES = (RideStatus.MATCHED, RideStatus.IN_PROGRESS)
+
+
 class DriverService:
-    def __init__(self, driver_repository: DriverRepository) -> None:
+    def __init__(self, driver_repository: DriverRepository, ride_repository: RideRepository) -> None:
         self._driver_repository = driver_repository
+        self._ride_repository = ride_repository
 
     def register_driver(self, user_id: str, vehicle_type: str, license_plate: str) -> Driver:
         if self._driver_repository.exists_by_id(user_id):
@@ -72,9 +81,9 @@ class DriverService:
     def go_offline(self, user_id: str) -> Driver:
         self.get_profile(user_id)
         self._driver_repository.clear_location(user_id)
-        # emitterRegistry.complete(userId) in the original closes this driver's SSE offer
-        # stream — deferred until Channels lands.
-        return self.mark_unavailable_by_id(user_id)
+        saved = self.mark_unavailable_by_id(user_id)
+        send_close(driver_offers_group(user_id))
+        return saved
 
     def mark_available_by_id(self, user_id: str) -> Driver:
         driver = self._driver_repository.find_by_id(user_id)
@@ -91,8 +100,11 @@ class DriverService:
     def update_location(self, user_id: str, lat: float, lng: float) -> None:
         self.get_profile(user_id)
         self._driver_repository.set_location(user_id, lat, lng)
-        # The original also emits a driver_location event to the rider on the driver's active
-        # ride — deferred until Channels lands.
+        ride = self._ride_repository.find_first_by_driver_id_and_status_in(user_id, _ACTIVE_RIDE_STATUSES)
+        if ride is not None:
+            eta = eta_minutes(haversine_km(lat, lng, ride.dropoff_lat, ride.dropoff_lng))
+            payload = json.dumps({"lat": lat, "lng": lng, "etaMinutes": eta})
+            send_event(ride_location_group(ride.id), "driver.location", payload)
 
     def find_nearby(self, lat: float, lng: float, radius_km: float) -> list[NearbyDriver]:
         return find_nearby_available_drivers(lat, lng, radius_km)

@@ -17,21 +17,18 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import cast
 
-import redis
+from asgiref.sync import async_to_sync
+from channels.layers import get_channel_layer
 from django.conf import settings
 from kafka import KafkaConsumer as RawKafkaConsumer
 from rest_framework.test import APIClient
 
 from rides import kafka_bridge, kafka_producer, tasks
-from rides.dispatch import (
-    DISPATCHED_KEY_PREFIX,
-    DISPATCHED_TTL_SECONDS,
-    RIDE_OFFER_CHANNEL_PREFIX,
-    fanout_to_nearby_drivers,
-)
+from rides.dispatch import DISPATCHED_KEY_PREFIX, DISPATCHED_TTL_SECONDS, fanout_to_nearby_drivers
 from rides.domain import Ride
 from rides.redis_client import get_client
 from rides.state import ride_repository
+from rides.streaming.groups import driver_offers_group, ride_location_group
 from rides.tasks import RETRY_CUTOFF
 from tests.conftest import register_and_login, register_driver
 
@@ -43,23 +40,21 @@ RIDE_REQUEST = {
 }
 
 
-def test_fanout_writes_dispatched_set_with_ttl_and_publishes_offer(client: APIClient) -> None:
+def test_fanout_writes_dispatched_set_with_ttl_and_sends_offer_via_channel_layer(
+    client: APIClient,
+) -> None:
     register_driver(client, "alice")
     client.post("/driver/mode/on", {"lat": 40.7128, "lng": -74.0060}, format="json")
     alice_id = client.get("/auth/me").data["user_id"]
 
-    redis_client = get_client()
-    # redis-py's pubsub()/PubSub.subscribe() are entirely untyped (no stub signature at all,
-    # not just an imprecise one) — same stub-quality gap already documented in claude.md for
-    # get()/incr() elsewhere in this project, just severe enough here to need `type: ignore`
-    # rather than a plain `cast()`.
-    pubsub = cast("redis.client.PubSub", redis_client.pubsub())  # type: ignore[no-untyped-call]
-    pubsub.subscribe(f"{RIDE_OFFER_CHANNEL_PREFIX}{alice_id}")  # type: ignore[no-untyped-call]
-    # subscribe() sends SUBSCRIBE without reading the response (redis-py deliberately leaves it
-    # for get_message(), so it doesn't risk swallowing a real message) — drain that confirmation
-    # now so the next get_message() call waits for the actual published offer.
-    confirmation = pubsub.get_message(timeout=2)
-    assert confirmation is not None and confirmation["type"] == "subscribe"
+    # Joins alice's own Channels group under a throwaway channel name — the same
+    # group_add()/receive() pair rides/streaming/consumers.py's DriverOffersConsumer does for a
+    # real SSE connection, just driven synchronously via async_to_sync instead of from inside an
+    # ASGI consumer.
+    channel_layer = get_channel_layer()
+    assert channel_layer is not None
+    test_channel = async_to_sync(channel_layer.new_channel)()
+    async_to_sync(channel_layer.group_add)(driver_offers_group(alice_id), test_channel)
 
     ride = Ride(
         rider_id="rider-x",
@@ -71,14 +66,15 @@ def test_fanout_writes_dispatched_set_with_ttl_and_publishes_offer(client: APICl
     )
     fanout_to_nearby_drivers(ride)
 
+    redis_client = get_client()
     dispatched_key = f"{DISPATCHED_KEY_PREFIX}{ride.id}"
     assert redis_client.smembers(dispatched_key) == {alice_id}
     ttl = cast("int", redis_client.ttl(dispatched_key))
     assert 0 < ttl <= DISPATCHED_TTL_SECONDS
 
-    message = pubsub.get_message(ignore_subscribe_messages=True, timeout=2)
-    assert message is not None
-    payload = json.loads(message["data"])
+    message = async_to_sync(channel_layer.receive)(test_channel)
+    assert message["type"] == "ride.offer"
+    payload = json.loads(message["payload"])
     assert payload == {
         "rideId": ride.id,
         "pickupLat": ride.pickup_lat,
@@ -89,7 +85,6 @@ def test_fanout_writes_dispatched_set_with_ttl_and_publishes_offer(client: APICl
         "etaMinutes": payload["etaMinutes"],
     }
     assert payload["etaMinutes"] >= 1
-    pubsub.close()
 
 
 def test_fanout_with_no_nearby_drivers_writes_nothing() -> None:
@@ -128,7 +123,47 @@ def test_handle_ride_requested_skips_a_ride_that_is_no_longer_requested(client: 
     assert get_client().exists(f"{DISPATCHED_KEY_PREFIX}{ride_id}") == 0
 
 
-def test_handle_ride_accepted_clears_the_dispatched_set(client: APIClient) -> None:
+def test_handle_ride_accepted_clears_dispatched_set_and_notifies_the_other_driver(
+    client: APIClient,
+) -> None:
+    register_and_login(client, "rider1")
+    ride_id = client.post("/rides", RIDE_REQUEST, format="json").data["id"]
+
+    accepted_driver = APIClient()
+    register_driver(accepted_driver, "driver1")
+    accepted_driver.post("/driver/mode/on", {"lat": 40.7128, "lng": -74.0060}, format="json")
+    accepted_driver_id = accepted_driver.get("/auth/me").data["user_id"]
+
+    other_driver = APIClient()
+    register_driver(other_driver, "driver2")
+    other_driver.post("/driver/mode/on", {"lat": 40.7130, "lng": -74.0062}, format="json")
+    other_driver_id = other_driver.get("/auth/me").data["user_id"]
+
+    channel_layer = get_channel_layer()
+    assert channel_layer is not None
+    other_channel = async_to_sync(channel_layer.new_channel)()
+    async_to_sync(channel_layer.group_add)(driver_offers_group(other_driver_id), other_channel)
+
+    tasks.handle_ride_requested(ride_id)
+    dispatched_key = f"{DISPATCHED_KEY_PREFIX}{ride_id}"
+    assert get_client().smembers(dispatched_key) == {accepted_driver_id, other_driver_id}
+
+    # other_driver is nearby and available too, so it gets its own ride.offer from the fanout
+    # above, same as accepted_driver did — drain that first before the offer.cancelled this test
+    # actually cares about.
+    offer_message = async_to_sync(channel_layer.receive)(other_channel)
+    assert offer_message["type"] == "ride.offer"
+
+    accepted_driver.post(f"/rides/{ride_id}/accept")
+    tasks.handle_ride_accepted(ride_id)
+    assert get_client().exists(dispatched_key) == 0
+
+    message = async_to_sync(channel_layer.receive)(other_channel)
+    assert message["type"] == "offer.cancelled"
+    assert json.loads(message["payload"]) == {"rideId": ride_id}
+
+
+def test_handle_ride_accepted_sends_eta_to_the_ride_location_group(client: APIClient) -> None:
     register_and_login(client, "rider1")
     ride_id = client.post("/rides", RIDE_REQUEST, format="json").data["id"]
 
@@ -136,12 +171,19 @@ def test_handle_ride_accepted_clears_the_dispatched_set(client: APIClient) -> No
     register_driver(driver, "driver1")
     driver.post("/driver/mode/on", {"lat": 40.7128, "lng": -74.0060}, format="json")
 
-    tasks.handle_ride_requested(ride_id)
-    dispatched_key = f"{DISPATCHED_KEY_PREFIX}{ride_id}"
-    assert get_client().exists(dispatched_key) == 1
+    channel_layer = get_channel_layer()
+    assert channel_layer is not None
+    ride_channel = async_to_sync(channel_layer.new_channel)()
+    async_to_sync(channel_layer.group_add)(ride_location_group(ride_id), ride_channel)
 
+    tasks.handle_ride_requested(ride_id)
+    driver.post(f"/rides/{ride_id}/accept")
     tasks.handle_ride_accepted(ride_id)
-    assert get_client().exists(dispatched_key) == 0
+
+    message = async_to_sync(channel_layer.receive)(ride_channel)
+    assert message["type"] == "driver.eta_to_pickup"
+    payload = json.loads(message["payload"])
+    assert payload["etaMinutes"] >= 1
 
 
 def test_retry_stale_rides_republishes_an_old_requested_ride(client: APIClient) -> None:

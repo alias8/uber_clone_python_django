@@ -14,6 +14,9 @@ dependencies = [
     "redis>=5.0,<6.5",
     "celery[redis]>=5.6.3",
     "kafka-python-ng>=2.2",
+    "channels>=4.1",
+    "channels_redis>=4.2",
+    "daphne>=4.1",
 ]
 
 [project.optional-dependencies]
@@ -25,6 +28,7 @@ dev = [
     "ruff>=0.7",
     "pytest>=8.3",
     "pytest-django>=4.9",
+    "pytest-asyncio>=0.24",
     # >=4.15 specifically: that's where testcontainers.community.{postgres,redis,kafka} (used by
     # tests/conftest.py) live — older 4.13.x keeps those same containers at the top level instead.
     # Deliberately NOT requesting testcontainers' own "redis" extra: that extra pins redis>=7,
@@ -61,6 +65,14 @@ ignore_errors = true
 module = "kafka.*"
 ignore_missing_imports = true
 
+[[tool.mypy.overrides]]
+# Neither channels nor channels_redis ships a py.typed marker or stubs — same class of gap as
+# kafka.* above. rides/streaming/ keeps its own surface (consumers.py, groups.py) explicitly
+# typed regardless; this override only silences the "no stubs" complaint about the library calls
+# themselves (e.g. `channel_layer.group_send(...)`'s return type is unknown to mypy either way).
+module = ["channels.*", "channels_redis.*", "daphne.*"]
+ignore_missing_imports = true
+
 [tool.ruff]
 line-length = 110
 src = ["config", "rides", "tests"]
@@ -80,3 +92,7 @@ known-first-party = ["config", "rides"]
 DJANGO_SETTINGS_MODULE = "config.settings"
 testpaths = ["tests"]
 python_files = ["test_*.py"]
+# "auto": only tests/test_streaming.py's `async def test_*` functions (exercising the Channels
+# consumers directly via channels.testing.ApplicationCommunicator) need this — every other test
+# in this project stays a plain synchronous function.
+asyncio_mode = "auto"

@@ -59,12 +59,19 @@ def _redis_setup() -> Iterator[None]:
     same idea as `django_db_setup` above, but simpler: `redis_client.get_client()` re-reads
     `settings.REDIS_URL` on every call and only rebuilds its cached client when the value
     changes, so a plain reassignment here (not an in-place mutation, unlike the DATABASES dict)
-    is enough to take effect before anything calls `get_client()` for the first time."""
+    is enough to take effect before anything calls `get_client()` for the first time.
+
+    Also repoints `settings.CHANNEL_LAYERS["default"]["CONFIG"]["hosts"]` (M5) at the same
+    container — `channels.layers.get_channel_layer()` lazily builds and caches its backend from
+    `settings.CHANNEL_LAYERS` on first access (nothing has accessed it yet this early in the
+    session), so this only needs to happen before that first access, same ordering guarantee
+    `django_db_setup` relies on for DATABASES."""
     with RedisContainer("redis:7-alpine") as redis_container:
-        django_settings.REDIS_URL = (
-            f"redis://{redis_container.get_container_host_ip()}:"
-            f"{redis_container.get_exposed_port(6379)}/0"
-        )
+        url = f"redis://{redis_container.get_container_host_ip()}:{redis_container.get_exposed_port(6379)}/0"
+        django_settings.REDIS_URL = url
+        # CHANNEL_LAYERS isn't a setting django-stubs models precisely (it's Channels', not
+        # Django's own), so mypy can't narrow the nested dict's value type here.
+        django_settings.CHANNEL_LAYERS["default"]["CONFIG"]["hosts"] = [url]  # type: ignore[index]
         yield
 
 

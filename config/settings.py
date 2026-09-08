@@ -16,9 +16,15 @@ DEBUG = True
 ALLOWED_HOSTS = ["*"]
 
 INSTALLED_APPS = [
+    # "daphne" first: Channels' documented pattern for making `manage.py runserver` itself serve
+    # ASGI_APPLICATION (below) via Daphne instead of Django's default WSGI dev server — this repo
+    # has no django.contrib.staticfiles installed, so there's no ordering conflict with that app's
+    # own runserver override to worry about.
+    "daphne",
     "django.contrib.auth",
     "django.contrib.contenttypes",
     "rest_framework",
+    "channels",
     "rides",
 ]
 
@@ -88,5 +94,27 @@ CELERY_BEAT_SCHEDULE = {
     "retry-stale-rides": {
         "task": "rides.retry_stale_rides",
         "schedule": 60.0,
+    },
+}
+
+# --- Channels (M5): real-time delivery for the driver-offers and ride-location streams, see
+# rides/streaming/. Backed by the same Redis this project already requires (M3) — a
+# `channels_redis.core.RedisChannelLayer` group_send is genuinely cross-process (unlike
+# `rides/redis_client.py`'s raw pub/sub, which needed rides/dispatch.py's M4 in-process listener
+# on the *consuming* side), so M4's Celery worker process can call it directly to notify a driver
+# whose SSE connection lives in the ASGI (Daphne) process, with no separate bridge process
+# needed — see README's Streaming section for the fuller "why".
+#
+# tests/conftest.py's `_redis_setup` fixture repoints `REDIS_URL` at a throwaway container *and*
+# mutates this dict's "hosts" list in place (not a fresh dict) before anything constructs a
+# channel layer for the first time — same "mutate in place, don't replace the dict" lesson M2's
+# DATABASES fixture already documented, applied here on the same kind of already-possibly-cached
+# settings object.
+CHANNEL_LAYERS = {
+    "default": {
+        "BACKEND": "channels_redis.core.RedisChannelLayer",
+        "CONFIG": {
+            "hosts": [REDIS_URL],
+        },
     },
 }

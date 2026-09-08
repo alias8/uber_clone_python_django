@@ -186,6 +186,16 @@ class RideRepository:
         rows = RideRow.objects.filter(status=status.value, requested_at__lt=cutoff)
         return [_ride_from_row(r) for r in rows]
 
+    def find_first_by_driver_id_and_status_in(
+        self, driver_id: str, statuses: tuple[RideStatus, ...]
+    ) -> Ride | None:
+        row = (
+            RideRow.objects.filter(driver_id=driver_id, status__in=[s.value for s in statuses])
+            .order_by("-requested_at")
+            .first()
+        )
+        return _ride_from_row(row) if row is not None else None
+
     def count_pending_near(self, lat: float, lng: float, delta: float = 0.01) -> int:
         return RideRow.objects.filter(
             status=RideStatus.REQUESTED.value,

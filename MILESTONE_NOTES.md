@@ -261,11 +261,119 @@ Celery + a dedicated Kafka-to-Celery bridge process, not an asyncio consumer loo
   real HTTP; and Celery Beat's own scheduler log confirmed it fired `retry-stale-rides` on its
   60-second interval, not just that the schedule was configured.
 
+## Milestone 5 — Django Channels
+
+- `rides/streaming/groups.py`: `send_event()`/`send_close()` wrap `channel_layer.group_send()`
+  (via `async_to_sync`) — the delivery mechanism for both streams. This *replaces* M4's
+  placeholder Redis pub/sub channel (`ride_offers:{driverId}`, written by `dispatch.py`, read by
+  nothing) rather than bridging it: `channels_redis`'s channel layer is itself Redis-backed and
+  genuinely cross-process, so a Celery worker can call `group_send()` directly and reach a
+  driver's SSE connection held open in the separate Daphne process, with no bridge process
+  needed — unlike `RideOfferListener.kt`/the FastAPI sibling's `ride_offer_listener.py`, both of
+  which need one because `SseEmitter`/`asyncio.Queue` have no cross-process delivery of their own.
+- `rides/dispatch.py`: `fanout_to_nearby_drivers()` now calls `send_event(..., "ride.offer", ...)`
+  instead of `client.publish(...)`; new `get_driver_location()` (ported from
+  `DriverService.kt::getDriverLocation`, cross-checked against the FastAPI sibling's own port) and
+  `notify_offer_cancelled_and_clear()` (replaces M4's `clear_dispatch` — now reads the
+  `dispatched:{rideId}` set *before* deleting it, notifying every other dispatched driver via
+  `offer.cancelled`, same order as the ported Kotlin/FastAPI handlers).
+- `rides/tasks.py::handle_ride_accepted` now sends `driver.eta_to_pickup` to the ride's location
+  group (via `get_driver_location` + the same Haversine/ETA formulas `services.py` already used)
+  and calls `notify_offer_cancelled_and_clear`. `handle_ride_completed`/`handle_ride_cancelled`
+  send `stream.close` to the ride's location group, closing the rider's stream.
+- `rides/services.py::DriverService` gained a `ride_repository` constructor dependency (for
+  `update_location`'s active-ride lookup) — `state.py` updated to pass it. `update_location` sends
+  `driver.location` to the ride's location group when the driver has an active
+  (`MATCHED`/`IN_PROGRESS`) ride; `go_offline` sends `stream.close` to the driver's own offers
+  group. Both run in-process (a Celery task doesn't call these — they're synchronous DRF view
+  code), so they call `send_event`/`send_close` directly rather than through a task.
+- New `rides/repositories.py::RideRepository.find_first_by_driver_id_and_status_in` (ported from
+  the FastAPI sibling's repository method of the same name) backs that lookup.
+- `rides/streaming/auth.py`: re-does `auth/authentication.py`'s token extraction
+  (Authorization-bearer-or-`auth_token`-cookie) against a raw ASGI `scope["headers"]` list instead
+  of a DRF `Request` — Channels consumers get neither `.headers` nor `.COOKIES`.
+  `StreamGuardError(status, detail)` is the Channels-consumer equivalent of `services.DomainError`.
+- `rides/streaming/consumers.py`: `DriverOffersConsumer`/`RideLocationConsumer`, both genuine
+  SSE-over-HTTP (not WebSocket — see README's "Streaming" section for the full reasoning on both
+  that choice and the group_send-over-pub/sub-bridge choice above). **The first design tried here
+  was wrong** and is worth recording: defining `ride_offer()`/`stream_close()`/etc. as per-type
+  handler methods, relying on `AsyncConsumer`'s own outer dispatch loop to invoke them (the
+  pattern a WebSocket consumer uses) — this deadlocks/races for `AsyncHttpConsumer` specifically,
+  because that outer loop calls `dispatch()` once for the `http.request` message and blocks
+  *inside* that single call for as long as `handle()` runs, while a second, framework-owned task
+  keeps concurrently polling the *same* channel-layer queue this module needs to read from itself,
+  occasionally stealing a message before a matching handler method could receive it (crashing the
+  connection with "No handler for message type ..."). Caught by reading Channels' own
+  `consumer.py`/`utils.py` source directly (`await_many_dispatch`'s `while True` loop `await
+  dispatch(result)`s sequentially, one task at a time) before writing a single test, not by
+  reproducing the race in a test — the source made the mechanism unambiguous once actually read
+  rather than assumed. Fixed by having `_SseStreamConsumer` override `__call__` entirely (no
+  `self.dispatch()`, no `http_request`/`http_disconnect`) and having `handle()` run its own
+  `asyncio.wait(..., FIRST_COMPLETED)` loop directly against the ASGI `receive` callable and
+  `self.channel_layer.receive(self.channel_name)`, exclusively. `AsyncHttpConsumer` stays the base
+  class purely for its `send_headers`/`send_body` helpers.
+- `config/asgi.py`: a real `ProtocolTypeRouter`/`URLRouter` — the two SSE paths route to the new
+  consumers, everything else falls through to a catch-all route to the plain Django ASGI app
+  (`get_asgi_application()`), so ordinary DRF views are completely unaffected. `"daphne"` added
+  first in `INSTALLED_APPS` (Channels' documented pattern) so `manage.py runserver` itself serves
+  ASGI instead of Django's default WSGI dev server.
+- `CHANNEL_LAYERS` (settings.py) uses `channels_redis.core.RedisChannelLayer` against the same
+  Redis this project already requires from M3 — no new infrastructure dependency, just a new
+  consumer of the same Redis.
+- Tests: `tests/test_streaming.py`, 6 new, driving the real consumer ASGI apps directly via
+  `channels.testing.ApplicationCommunicator` (not through `URLRouter` — `url_route` is supplied by
+  hand in each scope). Two guard-rejection tests per stream (missing auth, wrong role/ride status/
+  non-participant) plus one true live-delivery test per stream: connect, receive a **real**
+  group-sent event round-tripped through the actual Redis-backed channel layer, then either a
+  real client disconnect (`http.disconnect`) or a real server-initiated `stream.close` ending the
+  response on its own. This is a genuine improvement over both other repos here, not just a
+  language-appropriate equivalent: the Kotlin original has zero tests for this at all (its own
+  README says so), and the FastAPI sibling's `TestClient` can't read a live SSE stream in this
+  environment at all (its httpx transport buffers the whole response before returning), so its
+  `test_sse.py` could only test the registry and each call site in isolation. `test_dispatch.py`
+  also gained 2 tests (eta-to-pickup delivery, offer-cancelled delivery to the non-accepted
+  driver) and its existing fan-out test switched from asserting a raw Redis pub/sub message to
+  asserting a real channel-layer group-sent event. 70 tests passing total (63 + 6 in
+  `test_streaming.py` + 1 net new in `test_dispatch.py`), `ruff check .` and `mypy --strict` clean.
+- **New accepted mypy-strict exceptions** (see `claude.md`): `channels.*`/`channels_redis.*`/
+  `daphne.*` added to the existing `ignore_missing_imports` override (same treatment as `kafka.*`)
+  — plus two *additional* targeted ignores that override alone doesn't clear, because mypy strict
+  won't let you subclass or decorate with something typed as `Any`:
+  `_SseStreamConsumer(AsyncHttpConsumer)` needed `# type: ignore[misc]` on the class line, and each
+  `@database_sync_to_async`-decorated test helper needed `# type: ignore[untyped-decorator]`.
+  `config/asgi.py`'s catch-all `re_path(r"", django_asgi_app)` needed `# type: ignore[arg-type]`
+  too — django-stubs' `re_path()` only knows about WSGI-style views, not this documented
+  Channels pattern of routing to a raw ASGI callable.
+- **Real dependency snag, not a code bug**: `cbor2` (a `channels_redis` dependency) ships no
+  prebuilt wheel yet for this project's Python (3.14, very new) and its source build needs a Rust
+  toolchain not present here. Resolved by installing an older pure-Python `cbor2` release (5.9.0)
+  directly before installing `channels_redis`, rather than reaching for a Rust toolchain just to
+  build a serializer this project doesn't even need to pick — `channels_redis` falls back to it
+  only if `msgpack` (already a transitive dependency here) isn't picked instead at runtime either
+  way.
+- Manually verified against a real running `daphne` process plus a real Postgres and Redis
+  (throwaway Docker containers stood up for this pass, separate from the testcontainers-managed
+  ones `pytest` uses): a `curl -N` on `/driver/offers` received a real `ride_offer` SSE event
+  triggered from a completely separate process (`manage.py shell`, calling
+  `dispatch.fanout_to_nearby_drivers` directly) — genuine cross-process proof, the whole point of
+  switching to `group_send`; a `curl -N` on `/rides/{id}/location` received a real
+  `driver_location` event after a real `POST /driver/location`, then the connection closed on its
+  own the instant the ride was marked completed (timed at 0s against a 10s `curl -m` ceiling, not
+  just "eventually stopped"); `POST /driver/mode/off` closed an already-open `/driver/offers`
+  connection immediately, same way; unauthenticated requests to both endpoints got a plain 401
+  over real HTTP, not a hang. **One honest scope gap in this particular manual pass**: Kafka
+  wasn't in the loop — standing up a throwaway single-node Kafka broker by hand (outside
+  testcontainers) didn't work cleanly in the time available (the `apache/kafka` image needs KRaft
+  env vars this quick attempt didn't configure), so `fanout_to_nearby_drivers`/
+  `notify_offer_cancelled_and_clear` were called directly rather than through a real
+  `POST /rides` → Kafka → Celery round-trip. That round-trip itself is unchanged from M4 and
+  already has its own real-broker coverage (M4's own manual verification, plus this milestone's
+  automated `test_ride_request_is_dispatched_end_to_end_through_kafka_and_celery`, which didn't
+  need re-verifying by hand) — what this pass specifically needed to prove, and did, is that a
+  Celery-worker-triggered event actually reaches a live SSE connection in a different process.
+
 ## What's left
 
-- **Milestone 5** — Django Channels: the SSE-equivalent endpoints (`/rides/{id}/location`,
-  `/driver/offers`), plus the offer-cancelled-to-other-drivers notification M4 deferred (see
-  above).
-
-Milestones 6 (Docker/CI against real infra) and 7 (the AWS deployment doc port) are cancelled by
-James, not deferred — don't build them.
+Nothing planned. This project's milestone roadmap ends at M5 — **milestones 6 (Docker/CI against
+real infra) and 7 (the AWS deployment doc port) were explicitly cancelled by James**, not
+deferred. Don't build them without him asking again.

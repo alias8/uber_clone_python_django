@@ -19,7 +19,7 @@ ride_repository = RideRepository()
 rating_repository = RatingRepository()
 pricing_service = PricingService()
 
-driver_service = DriverService(driver_repository)
+driver_service = DriverService(driver_repository, ride_repository)
 ride_service = RideService(ride_repository, driver_repository, driver_service, pricing_service)
 rating_service = RatingService(rating_repository, ride_repository, user_repository, driver_repository)
 
