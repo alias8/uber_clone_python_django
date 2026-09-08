@@ -9,6 +9,7 @@ dependencies = [
     "pyjwt>=2.9",
     "bcrypt>=4.2",
     "psycopg[binary]>=3.2",
+    "redis>=5.0",
 ]
 
 [project.optional-dependencies]
@@ -19,7 +20,7 @@ dev = [
     "ruff>=0.7",
     "pytest>=8.3",
     "pytest-django>=4.9",
-    "testcontainers[postgres]>=4.8",
+    "testcontainers[postgres,redis]>=4.8",
 ]
 
 [build-system]

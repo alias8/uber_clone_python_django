@@ -58,13 +58,13 @@ class DriverService:
         return driver
 
     def go_online(self, user_id: str, lat: float, lng: float) -> Driver:
-        driver = self.get_profile(user_id)
-        self._driver_repository.save(replace(driver, lat=lat, lng=lng))
+        self.get_profile(user_id)
+        self._driver_repository.set_location(user_id, lat, lng)
         return self.mark_available_by_id(user_id)
 
     def go_offline(self, user_id: str) -> Driver:
-        driver = self.get_profile(user_id)
-        self._driver_repository.save(replace(driver, lat=None, lng=None))
+        self.get_profile(user_id)
+        self._driver_repository.clear_location(user_id)
         # emitterRegistry.complete(userId) in the original closes this driver's SSE offer
         # stream — deferred until Channels lands.
         return self.mark_unavailable_by_id(user_id)
@@ -82,13 +82,13 @@ class DriverService:
         return self._driver_repository.save(replace(driver, is_available=False))
 
     def update_location(self, user_id: str, lat: float, lng: float) -> None:
-        driver = self.get_profile(user_id)
-        self._driver_repository.save(replace(driver, lat=lat, lng=lng))
+        self.get_profile(user_id)
+        self._driver_repository.set_location(user_id, lat, lng)
         # The original also emits a driver_location event to the rider on the driver's active
         # ride — deferred until Channels lands.
 
     def find_nearby(self, lat: float, lng: float, radius_km: float) -> list[NearbyDriver]:
-        return find_nearby_available_drivers(lat, lng, self._driver_repository.all(), radius_km)
+        return find_nearby_available_drivers(lat, lng, radius_km)
 
 
 class RideService:
@@ -202,9 +202,7 @@ class RideService:
     def _calculate_fare(self, ride: Ride) -> Decimal:
         pending_rides = self._ride_repository.count_pending_near(ride.pickup_lat, ride.pickup_lng)
         available_drivers = len(
-            find_nearby_available_drivers(
-                ride.pickup_lat, ride.pickup_lng, self._driver_repository.all(), SURGE_SEARCH_RADIUS_KM
-            )
+            find_nearby_available_drivers(ride.pickup_lat, ride.pickup_lng, SURGE_SEARCH_RADIUS_KM)
         )
         fare, _surge = self._pricing_service.get_fare_quote(
             ride.pickup_lat,

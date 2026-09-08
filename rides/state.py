@@ -23,7 +23,13 @@ driver_service = DriverService(driver_repository)
 ride_service = RideService(ride_repository, driver_repository, driver_service, pricing_service)
 rating_service = RatingService(rating_repository, ride_repository, user_repository, driver_repository)
 
-ride_request_rate_limiter = RateLimiter(capacity=settings.RIDE_REQUEST_LIMIT_PER_MINUTE, window_seconds=60)
+ride_request_rate_limiter = RateLimiter(
+    capacity=settings.RIDE_REQUEST_LIMIT_PER_MINUTE,
+    window_seconds=60,
+    key_prefix="rate_limit:ride_request:",
+)
 auth_attempt_rate_limiter = RateLimiter(
-    capacity=settings.AUTH_ATTEMPTS_LIMIT_PER_15_MIN, window_seconds=15 * 60
+    capacity=settings.AUTH_ATTEMPTS_LIMIT_PER_15_MIN,
+    window_seconds=15 * 60,
+    key_prefix="rate_limit:auth:",
 )

@@ -109,10 +109,63 @@ history produced.
 - 55 tests passing (unchanged from M1 — this milestone was a backing-store swap, not new
   endpoints), `ruff check .` and `mypy` clean.
 
+## Milestone 3 — Redis
+
+- Driver geo-index (`drivers:locations`, real `GEOSEARCH`) and availability set
+  (`drivers:available`) replace the M2 in-memory `_locations` overlay dict — `dispatch.py`'s
+  `find_nearby_available_drivers()` does the reads directly against Redis (no more `list[Driver]`
+  argument — it queries Redis itself now); `repositories.py`'s new
+  `DriverRepository.set_location()`/`clear_location()` do the writes. `Driver.lat`/`Driver.lng`
+  are gone from `domain.py` entirely — location was never anything but an overlay for this
+  dataclass, and now it isn't even that.
+- `DriverRepository.save()` keeps `is_available` a genuine dual write, same as `DriverService.kt`:
+  a Postgres column update plus a `drivers:available` Redis `SADD`/`SREM` — kept strictly separate
+  from location, on purpose, per the M2 note above about the FastAPI sibling's real bug (bundling
+  the two would wipe a driver's position out of Redis on every plain availability toggle, since
+  `mark_available_by_id`/`mark_unavailable_by_id` always re-fetch the driver first with no location
+  info).
+- Surge cache (`pricing.py`'s `SurgeCache`) moved from an in-memory dict to real Redis
+  (`SET key value EX 30`/`GET key`, same `surge:{lat}:{lng}` grid key format as before). Rate
+  limiting (`rate_limit.py`) moved from an in-memory fixed-window dict to a Redis-backed one
+  (`INCR`+`EXPIRE` on the first hit of a window), hand-rolled rather than pulling in a library —
+  unlike the FastAPI sibling's move to the `limits` package, a bare `INCR`/`EXPIRE` pair is all a
+  fixed window needs, and Redis's `INCR` is atomic on its own, so (unlike M1's in-memory version)
+  no local lock was needed either. Key format matches `RateLimiterService.kt` exactly
+  (`rate_limit:ride_request:{userId}` / `rate_limit:auth:{ip}`).
+- `redis_client.py` is a single process-wide singleton, not one client per running event loop like
+  the FastAPI sibling's own module. That per-loop caching solves a real problem there — an async
+  Redis client is bound to whichever asyncio event loop created it, and `TestClient` gives each
+  test its own loop — but this Django app is synchronous end to end (a deliberate M2 choice), so
+  there's no event loop for a client to bind to. Confirmed this wasn't needed rather than assuming
+  it: ran the full suite and watched for any "attached to a different loop"-shaped failure before
+  concluding the simpler singleton was safe here.
+- Removed the now-dead `DriverRepository.all()`/`.clear()`, `count_nearby_available_drivers()`
+  (already unused before this milestone), `SurgeCache.clear()`, `PricingService.clear_cache()`,
+  and `RateLimiter.clear()` — same dead-code removals the FastAPI sibling made at its own M3, for
+  the same reason: once Redis owns this state, a single `FLUSHDB` in the test fixture replaces all
+  of the individual `.clear()` calls at once.
+- `tests/conftest.py` gained a `_redis_setup` session fixture (a throwaway Redis via
+  testcontainers, mirroring `django_db_setup`'s Postgres one) and `_reset_state` now does one
+  `FLUSHDB` instead of three separate `.clear()` calls. No bug here to speak of: unlike
+  `DATABASES["default"]`, `settings.REDIS_URL` is a plain value `redis_client.get_client()` re-reads
+  on every call and compares against its own cached copy, so a plain reassignment (not the
+  in-place-mutation workaround M2 needed for the Postgres dict) was enough.
+- All 55 tests passed on the first full run against real Postgres + Redis testcontainers — no new
+  bug surfaced during automated testing this milestone (M1 and M2 each hit one). Manually verified
+  the parts a test suite can't easily prove instead, against a real local Postgres/Redis and the
+  dev server: a far-away driver (NYC vs. LA) and an offline-but-registered driver were both
+  correctly excluded from a 5km nearby search; the 6th ride-request within a minute got a real 429
+  (confirmed via `redis-cli TTL` that the window's `EXPIRE` was actually set); killed and restarted
+  the dev server process entirely and confirmed via a fresh `/driver/nearby` call that the online
+  driver's location and availability both survived — proof this state is genuinely in Redis, not
+  process memory.
+- `ruff check .` and `mypy --strict` clean, one straightforward fix needed: redis-py's stubs type
+  `GET`'s return as `bytes | str | None` regardless of the client's `decode_responses=True`
+  constructor argument, so `SurgeCache.get()` needed a documented `cast("str | None", ...)` — this
+  is a different, narrower gap than the existing `many=True` mypy exception, not an extension of it.
+
 ## What's left
 
-- **Milestone 3** — Redis: driver geo-index (`GEOSEARCH`), availability set, surge cache,
-  Redis-backed rate limiting.
 - **Milestone 4** — Celery: the Kafka-consuming dispatch pipeline
   (`ride-requested`/`accepted`/`completed`/`cancelled`) + the stale-ride retry job.
 - **Milestone 5** — Django Channels: the SSE-equivalent endpoints (`/rides/{id}/location`,

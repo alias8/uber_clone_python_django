@@ -1,17 +1,25 @@
-"""Postgres-backed persistence via the Django ORM (M2). Method names (save/find_by_id/
-exists_by_*) are unchanged from M1's in-memory version — that was the point of choosing them
-there — and match the FastAPI sibling's own SQLAlchemy repository method names too.
+"""Postgres-backed persistence via the Django ORM (M2), plus the Redis-backed driver
+geo-index/availability set as of M3. Method names (save/find_by_id/exists_by_*) are unchanged
+from M1's in-memory version — that was the point of choosing them there — and match the FastAPI
+sibling's own SQLAlchemy repository method names too.
 
-Driver lat/lng are the one exception: they're not columns in uber_clone's schema (that's a
-Redis GEOSEARCH index in the real system, wired up here in M3), so they stay in an in-memory
-overlay dict here, merged onto rows read from Postgres — same pattern the FastAPI sibling used
-at its own M2 (see its repositories.py docstring).
+Driver lat/lng are the one exception: they're not columns in uber_clone's schema at all (that's a
+Redis GEOSEARCH index in the real system) — `DriverRepository.set_location()`/`clear_location()`
+write directly to Redis, never to Postgres or the `Driver` dataclass. `save()` does a real dual
+write for `is_available`: a Postgres column update plus a `drivers:available` Redis set
+add/remove, same as `DriverService.kt`. Location is kept entirely separate from `save()` on
+purpose — a plain availability toggle (`mark_available_by_id`/`mark_unavailable_by_id`) always
+re-fetches the driver first, with no location info, so bundling the two would wipe a driver's
+position out of Redis on every `go_online`/availability change (a real bug the FastAPI sibling hit
+at its own M3 — see MILESTONE_NOTES.md).
 """
 
 from __future__ import annotations
 
+from rides.dispatch import DRIVER_AVAILABLE_SET, DRIVER_GEO_KEY
 from rides.domain import Driver, Rating, Ride, RideStatus, Role, User
 from rides.models import DriverRow, RatingRow, RideRow, UserRow
+from rides.redis_client import get_client
 
 ACTIVE_RIDE_STATUSES = (RideStatus.REQUESTED, RideStatus.MATCHED, RideStatus.IN_PROGRESS)
 
@@ -87,16 +95,6 @@ class UserRepository:
 
 
 class DriverRepository:
-    def __init__(self) -> None:
-        # In-memory stand-in for the Redis geo-index, until M3 — see module docstring.
-        self._locations: dict[str, tuple[float, float]] = {}
-
-    def _with_location(self, driver: Driver) -> Driver:
-        loc = self._locations.get(driver.user_id)
-        if loc is not None:
-            driver.lat, driver.lng = loc
-        return driver
-
     @staticmethod
     def _driver_from_row(row: DriverRow) -> Driver:
         return Driver(
@@ -109,11 +107,6 @@ class DriverRepository:
         )
 
     def save(self, driver: Driver) -> Driver:
-        if driver.lat is not None and driver.lng is not None:
-            self._locations[driver.user_id] = (driver.lat, driver.lng)
-        else:
-            self._locations.pop(driver.user_id, None)
-
         row, _created = DriverRow.objects.update_or_create(
             user_id=driver.user_id,
             defaults={
@@ -124,21 +117,29 @@ class DriverRepository:
                 "rating_count": driver.rating_count,
             },
         )
-        return self._with_location(self._driver_from_row(row))
+
+        # Dual write, same as DriverService.kt: Postgres owns is_available; the availability set
+        # is the fast-path Redis mirror dispatch.py filters against. Never touches the geo-index.
+        redis_client = get_client()
+        if driver.is_available:
+            redis_client.sadd(DRIVER_AVAILABLE_SET, driver.user_id)
+        else:
+            redis_client.srem(DRIVER_AVAILABLE_SET, driver.user_id)
+
+        return self._driver_from_row(row)
+
+    def set_location(self, user_id: str, lat: float, lng: float) -> None:
+        get_client().geoadd(DRIVER_GEO_KEY, [lng, lat, user_id])
+
+    def clear_location(self, user_id: str) -> None:
+        get_client().zrem(DRIVER_GEO_KEY, user_id)
 
     def find_by_id(self, user_id: str) -> Driver | None:
         row = DriverRow.objects.filter(user_id=user_id).first()
-        return self._with_location(self._driver_from_row(row)) if row is not None else None
+        return self._driver_from_row(row) if row is not None else None
 
     def exists_by_id(self, user_id: str) -> bool:
         return DriverRow.objects.filter(user_id=user_id).exists()
-
-    def all(self) -> list[Driver]:
-        return [self._with_location(self._driver_from_row(r)) for r in DriverRow.objects.all()]
-
-    def clear(self) -> None:
-        DriverRow.objects.all().delete()
-        self._locations.clear()
 
 
 class RideRepository:

@@ -68,3 +68,5 @@ COOKIE_SECURE = os.environ.get("COOKIE_SECURE", "false").lower() == "true"
 
 RIDE_REQUEST_LIMIT_PER_MINUTE = 5
 AUTH_ATTEMPTS_LIMIT_PER_15_MIN = 10
+
+REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")

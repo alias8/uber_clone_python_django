@@ -1,43 +1,34 @@
-"""In-memory stand-in for uber_clone's Bucket4j-based RateLimiterService.kt.
+"""Redis-backed fixed-window rate limiter, ported from uber_clone's Bucket4j-based
+RateLimiterService.kt.
 
-Fixed-window counter, not a true token bucket — close enough to prove the "N requests per
-window, per key" behavior for M1. Likely replaced by a Redis-backed limiter in M3 (Celery/
-Channels for the async pieces land first — see MILESTONE_NOTES.md), which would also make rate
-limits work across multiple instances (this one doesn't).
+Fixed-window counter (`INCR` + `EXPIRE` on the first hit of a window), not a true token bucket —
+same simplification the FastAPI sibling made against Bucket4j via the `limits` package, just
+hand-rolled here rather than pulling in a library, since a single-command-pair `INCR`/`EXPIRE` is
+all a fixed window needs. Key format matches `RateLimiterService.kt` exactly
+(`rate_limit:ride_request:{key}` / `rate_limit:auth:{key}`), passed in via `key_prefix` so this
+class stays generic across both limiters `state.py` constructs.
+
+`INCR` is atomic in Redis, so — unlike M1's in-memory version — no local lock is needed even
+though this Django app is otherwise synchronous and single-threaded per worker; concurrent
+requests across multiple workers/processes now share one real counter, which the in-memory
+version never could.
 """
 
 from __future__ import annotations
 
-import threading
-import time
-from dataclasses import dataclass
-
-
-@dataclass
-class _Window:
-    count: int
-    window_start: float
+from rides.redis_client import get_client
 
 
 class RateLimiter:
-    def __init__(self, capacity: int, window_seconds: float) -> None:
+    def __init__(self, capacity: int, window_seconds: int, key_prefix: str) -> None:
         self._capacity = capacity
         self._window_seconds = window_seconds
-        self._windows: dict[str, _Window] = {}
-        self._lock = threading.Lock()
+        self._key_prefix = key_prefix
 
     def allow(self, key: str) -> bool:
-        now = time.monotonic()
-        with self._lock:
-            window = self._windows.get(key)
-            if window is None or now - window.window_start >= self._window_seconds:
-                self._windows[key] = _Window(count=1, window_start=now)
-                return True
-            if window.count >= self._capacity:
-                return False
-            window.count += 1
-            return True
-
-    def clear(self) -> None:
-        with self._lock:
-            self._windows.clear()
+        redis_key = f"{self._key_prefix}{key}"
+        client = get_client()
+        count = client.incr(redis_key)
+        if count == 1:
+            client.expire(redis_key, self._window_seconds)
+        return bool(count <= self._capacity)

@@ -6,8 +6,9 @@ from django.core.management import call_command
 from pytest_django.plugin import DjangoDbBlocker
 from rest_framework.test import APIClient
 from testcontainers.community.postgres import PostgresContainer
+from testcontainers.community.redis import RedisContainer
 
-from rides import state
+from rides.redis_client import get_client
 
 
 @pytest.fixture(scope="session")
@@ -46,18 +47,33 @@ def django_db_setup(django_db_blocker: DjangoDbBlocker | None) -> Iterator[None]
         yield
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _redis_setup() -> Iterator[None]:
+    """Points `settings.REDIS_URL` at a throwaway Redis container for the whole test session —
+    same idea as `django_db_setup` above, but simpler: `redis_client.get_client()` re-reads
+    `settings.REDIS_URL` on every call and only rebuilds its cached client when the value
+    changes, so a plain reassignment here (not an in-place mutation, unlike the DATABASES dict)
+    is enough to take effect before anything calls `get_client()` for the first time."""
+    with RedisContainer("redis:7-alpine") as redis_container:
+        django_settings.REDIS_URL = (
+            f"redis://{redis_container.get_container_host_ip()}:"
+            f"{redis_container.get_exposed_port(6379)}/0"
+        )
+        yield
+
+
 @pytest.fixture(autouse=True)
 def _reset_state(db: None) -> None:
     """Depending on pytest-django's `db` fixture gives every test its own transaction against
     the real Postgres container, rolled back afterward — that's what resets DB rows, the same
     guarantee the FastAPI sibling gets from a manual per-test TRUNCATE, just automatic here.
-    Process-local state (the driver location overlay, the pricing cache, both rate limiters)
-    isn't a database row, so it still needs clearing directly — `driver_repository.clear()` also
-    issues a (redundant-with-the-rollback, but harmless) DriverRow delete alongside that."""
-    state.driver_repository.clear()
-    state.pricing_service.clear_cache()
-    state.ride_request_rate_limiter.clear()
-    state.auth_attempt_rate_limiter.clear()
+
+    Everything else this app keeps process-local state in (the driver geo-index/availability
+    set, the surge cache, both rate limiters) now lives in the same real Redis container, so one
+    `FLUSHDB` clears all of it at once — same approach the FastAPI sibling's own conftest.py
+    uses, and the reason none of those classes has a `.clear()` method anymore (see
+    MILESTONE_NOTES.md's M3 entry)."""
+    get_client().flushdb()
 
 
 @pytest.fixture

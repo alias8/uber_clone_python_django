@@ -5,15 +5,18 @@ plain in-process module instead — a deliberate scope simplification (see READM
 piece, matching the same call the FastAPI sibling made. The formulas and constants are ported
 exactly from PricingGrpcService.kt so a known pickup/dropoff pair and a known
 pending-rides/available-drivers ratio produce the same numbers.
+
+The surge cache is backed by real Redis as of M3 (`SET ... EX`), same ~1km grid key format and
+30s TTL as PricingGrpcService.kt's own Redis-backed cache.
 """
 
 from __future__ import annotations
 
-import time
-from dataclasses import dataclass
 from decimal import ROUND_HALF_UP, Decimal
+from typing import cast
 
 from rides.geo import haversine_km
+from rides.redis_client import get_client
 
 BASE_FARE = Decimal("2.00")
 PER_KM_RATE = Decimal("1.50")
@@ -48,41 +51,27 @@ def calculate_fare(distance_km: float, surge_multiplier: Decimal) -> Decimal:
     return (base * surge_multiplier).quantize(TWO_PLACES, rounding=ROUND_HALF_UP)
 
 
-@dataclass
-class _CacheEntry:
-    value: Decimal
-    expires_at: float
-
-
 class SurgeCache:
-    """In-memory stand-in for the Redis `SET ... EX` cache used from M3 onward."""
-
-    def __init__(self) -> None:
-        self._entries: dict[str, _CacheEntry] = {}
+    """Redis-backed surge multiplier cache — `SET key value EX 30`/`GET key` against the same
+    `surge:{lat}:{lng}` grid key format used before Redis backed this (see `surge_grid_key`)."""
 
     def get(self, key: str) -> Decimal | None:
-        entry = self._entries.get(key)
-        if entry is None or entry.expires_at <= time.monotonic():
-            return None
-        return entry.value
+        # redis-py types GET's return as bytes | str | None regardless of decode_responses; the
+        # client is constructed with decode_responses=True (see redis_client.py), so this is
+        # always a str at runtime.
+        value = cast("str | None", get_client().get(key))
+        return Decimal(value) if value is not None else None
 
     def set(self, key: str, value: Decimal, ttl_seconds: int = SURGE_TTL_SECONDS) -> None:
-        self._entries[key] = _CacheEntry(value=value, expires_at=time.monotonic() + ttl_seconds)
-
-    def clear(self) -> None:
-        self._entries.clear()
+        get_client().set(key, str(value), ex=ttl_seconds)
 
 
 class PricingService:
     """Computes fare quotes. Callers supply the pending-ride and available-driver counts —
-    where those counts come from (in-memory repos for now, Postgres/Redis from M2/M3) is not
-    this module's concern."""
+    where those counts come from (Postgres/Redis) is not this module's concern."""
 
     def __init__(self, cache: SurgeCache | None = None) -> None:
         self._cache = cache or SurgeCache()
-
-    def clear_cache(self) -> None:
-        self._cache.clear()
 
     def get_surge_multiplier(
         self, lat: float, lng: float, pending_rides: int, available_drivers: int
