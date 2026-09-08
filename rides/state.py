@@ -1,8 +1,9 @@
-"""Process-wide singletons for M1's in-memory backing stores.
+"""Process-wide singletons wiring repositories and services together.
 
 Stands in for Spring's singleton-bean wiring (and the FastAPI sibling's own state.py, same
-idea). From M2 onward these get replaced by proper Django ORM-backed managers/querysets — this
-module is the seam where that swap happens.
+idea). The repositories are now Postgres-backed via the Django ORM (see repositories.py) — this
+module's job is unchanged from M1: wire one instance of each repository/service for the whole
+process.
 """
 
 from django.conf import settings

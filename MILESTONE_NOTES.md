@@ -49,16 +49,74 @@ history produced.
   test suite.
 - 55 tests passing, `ruff check .` and `mypy` clean.
 
+## Milestone 2 — Postgres
+
+- Real Django ORM models (`rides/models.py`: `UserRow`/`DriverRow`/`RideRow`/`RatingRow`)
+  replacing the in-memory dataclass repos from M1. `domain.py` survived as-is — it keeps the
+  plain dataclasses `services.py` operates on, unchanged; `repositories.py` is the only module
+  translating between the two, mirroring the FastAPI sibling's `models.py`/`db/tables.py` split
+  (see `claude.md`).
+- Three migrations (`rides/migrations/0001_baseline_schema.py`/`0002_ride_indexes.py`/
+  `0003_rating_count.py`), hand-written rather than a single `makemigrations` run through to the
+  final schema, so the migration history mirrors `uber_clone`'s `V1`/`V2`/`V3` Flyway migrations
+  one-to-one: 0001 creates all four tables plus the `ratings` unique constraint (matching V1
+  exactly, including that constraint living in the baseline migration, not a later one); 0002
+  adds just the four `rides` indexes (matching V2); 0003 adds `rating_count` to `users`/`drivers`
+  plus a `RunPython` backfill from existing `ratings` rows (matching V3's `UPDATE` statements —
+  a no-op on this project's always-fresh database, but faithful to what the Kotlin migration
+  actually does against one with existing data). `makemigrations --check --dry-run` confirms
+  these three, applied in order, produce exactly the schema `models.py` describes — no drift.
+  Verified the resulting Postgres schema column-for-column against `V1`-`V3` directly with
+  `psql \d`; the only differences are ones Django adds automatically for every `CharField`
+  primary key/unique column (`_like` btree indexes for pattern-matching), not anything this port
+  chose.
+- Kept driver lat/lng out of Postgres entirely, matching `uber_clone`'s `Driver` JPA entity
+  (no such column) and the FastAPI sibling's own M2 — `DriverRepository` keeps an in-memory
+  `_locations` overlay dict, merged onto rows read from Postgres, until M3 replaces it with a
+  real Redis geo-index.
+- One deliberate faithfulness choice against the FastAPI sibling rather than in agreement with
+  it: `DriverRow.user_id` has no `ForeignKey("users.id")` here, because the literal
+  `V1__baseline_schema.sql` doesn't declare that constraint either (just a bare primary key) —
+  the FastAPI sibling's SQLAlchemy table added one anyway. Matched the actual migration SQL over
+  matching the sibling's ORM.
+- Tests moved from M1's pure in-memory stores to a real throwaway Postgres via `testcontainers`
+  for the whole session (`tests/conftest.py`'s `django_db_setup`), same idea as the FastAPI
+  sibling's own `_postgres` fixture. Per-test isolation is simpler here than the sibling's manual
+  `TRUNCATE`: depending on pytest-django's built-in `db` fixture wraps each test in its own
+  transaction and rolls it back automatically.
+- **Real bug hit while wiring up `django_db_setup`**: repointing Django at the testcontainers
+  Postgres by replacing `settings.DATABASES["default"]` with a brand-new dict silently didn't
+  work — every test kept trying to connect to the `postgres`/`localhost` fallback baked into
+  `config/settings.py`, even though the fixture had clearly "set" the new URL first. Root cause:
+  by the time that fixture body runs, pytest-django's own `django_db_blocker` setup has already
+  forced Django's `ConnectionHandler` to create and cache a connection wrapper for the `default`
+  alias from the *original* dict object, and that wrapper keeps its own reference to it —
+  replacing the dict swaps what `settings.DATABASES["default"]` points to, but the already-cached
+  wrapper never looks there again. Fixed by mutating the existing dict **in place**
+  (`django_settings.DATABASES["default"].update({...})`) instead of replacing it, since every
+  existing reference (cached wrapper included) points at that same dict object. Took a short
+  detour with a standalone `python -c` repro against a real Django shell to confirm the caching
+  behavior before landing on the fix.
+- Two straightforward mypy-strict fixes, both one-liners: a migration's `dependencies = []`
+  needed to drop an explicit `list[tuple[str, str]]` type annotation (django-stubs types
+  `Migration.dependencies` as a class variable; re-annotating it in a subclass reads as
+  overriding a class variable with an instance one); the testcontainers `PORT` value needed
+  `str(...)` around it since `DATABASES["default"]` is typed `dict[str, str]`.
+- Manually verified the full ride lifecycle against a real local Postgres (register → driver
+  register → go online → request ride → accept → start → complete → rate) via `curl`, then
+  killed and restarted the dev server and confirmed via `psql` that the completed ride and the
+  driver's updated `avg_rating`/`rating_count` both survived — proof this is no longer in-memory.
+- 55 tests passing (unchanged from M1 — this milestone was a backing-store swap, not new
+  endpoints), `ruff check .` and `mypy` clean.
+
 ## What's left
 
-- **Milestone 2** — the Django ORM against Postgres, replacing the in-memory repos (and deciding
-  then whether `domain.py` survives as-is, shrinks to just the enums, or goes away entirely in
-  favor of real Django model classes — see `claude.md`).
 - **Milestone 3** — Redis: driver geo-index (`GEOSEARCH`), availability set, surge cache,
   Redis-backed rate limiting.
 - **Milestone 4** — Celery: the Kafka-consuming dispatch pipeline
   (`ride-requested`/`accepted`/`completed`/`cancelled`) + the stale-ride retry job.
 - **Milestone 5** — Django Channels: the SSE-equivalent endpoints (`/rides/{id}/location`,
   `/driver/offers`).
-- **Milestone 6** — Docker + docker-compose + GitHub Actions CI running against real infra.
-- **Milestone 7 (stretch)** — port the multi-region AWS deployment doc.
+
+Milestones 6 (Docker/CI against real infra) and 7 (the AWS deployment doc port) are cancelled by
+James, not deferred — don't build them.

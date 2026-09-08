@@ -1,16 +1,12 @@
 """Django settings for the uber_clone-django project.
 
-M1 has no ORM models of its own (see rides/domain.py) — the default sqlite3 database here only
-backs Django's own contrib apps (auth/admin/contenttypes), which the project scaffold pulls in
-by convention. Postgres arrives with our own models in M2.
+Postgres-backed as of M2 — see rides/models.py for the ORM models and rides/repositories.py for
+the translation to/from the plain-dataclass domain types in rides/domain.py.
 """
 
 from __future__ import annotations
 
 import os
-from pathlib import Path
-
-BASE_DIR = Path(__file__).resolve().parent.parent
 
 # Placeholder, dev-only — matches the sibling FastAPI project's own "change-me" default. Real
 # deployments would pull this from the environment; there are none for this repo (see README).
@@ -36,8 +32,12 @@ ASGI_APPLICATION = "config.asgi.application"
 
 DATABASES = {
     "default": {
-        "ENGINE": "django.db.backends.sqlite3",
-        "NAME": BASE_DIR / "db.sqlite3",
+        "ENGINE": "django.db.backends.postgresql",
+        "NAME": os.environ.get("POSTGRES_DB", "uber_clone_django"),
+        "USER": os.environ.get("POSTGRES_USER", "postgres"),
+        "PASSWORD": os.environ.get("POSTGRES_PASSWORD", "postgres"),
+        "HOST": os.environ.get("POSTGRES_HOST", "localhost"),
+        "PORT": os.environ.get("POSTGRES_PORT", "5432"),
     }
 }
 

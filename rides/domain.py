@@ -2,10 +2,10 @@
 Role.kt, RideStatus.kt).
 
 Deliberately named `domain.py`, not `models.py` — in a Django app `models.py` means Django ORM
-models by strong convention (registered for migrations, admin, etc.), and these are plain
-dataclasses backed by in-memory repositories, same as the FastAPI sibling's own `models.py` was
-at this milestone. Real Django ORM models land in M2 alongside Postgres, at which point they'll
-live in `models.py` for real — see MILESTONE_NOTES.md.
+models by strong convention (registered for migrations, admin, etc.), and `rides/models.py` is
+exactly that as of M2. These stay plain dataclasses, translated to/from the ORM rows in
+`repositories.py`, matching the FastAPI sibling's own `models.py` (domain) vs. `db/tables.py`
+(ORM) split.
 """
 
 from __future__ import annotations
