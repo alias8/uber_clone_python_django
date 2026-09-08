@@ -1,0 +1,62 @@
+[project]
+name = "uber-clone-django"
+version = "0.1.0"
+description = "Django/DRF sibling of uber_clone: the same ride-hailing domain, built with idiomatic Django instead of Kotlin/Spring or FastAPI. Fare/surge quoting is an in-process module here, not the separate gRPC service the Kotlin original uses."
+requires-python = ">=3.12"
+dependencies = [
+    "django>=5.1,<5.2",
+    "djangorestframework>=3.15",
+    "pyjwt>=2.9",
+    "bcrypt>=4.2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "mypy>=1.13",
+    "django-stubs[compatible-mypy]>=5.1",
+    "djangorestframework-stubs[compatible-mypy]>=3.15",
+    "ruff>=0.7",
+    "pytest>=8.3",
+    "pytest-django>=4.9",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["config*", "rides*"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+plugins = ["mypy_django_plugin.main", "mypy_drf_plugin.main"]
+files = ["config", "rides", "tests"]
+
+[tool.django-stubs]
+django_settings_module = "config.settings"
+
+[[tool.mypy.overrides]]
+# manage.py is a stock Django entrypoint script, not worth strict-typing.
+module = "manage"
+ignore_errors = true
+
+[tool.ruff]
+line-length = 110
+src = ["config", "rides", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["config", "rides"]
+
+[tool.ruff.lint.flake8-bugbear]
+# DRF's class-based views assign permission_classes/authentication_classes as class-level list
+# attributes, not function defaults, so B008 doesn't apply here the way it does for FastAPI's
+# Depends() pattern in the sibling repo — nothing to extend-immutable-calls for in this project.
+
+[tool.pytest.ini_options]
+DJANGO_SETTINGS_MODULE = "config.settings"
+testpaths = ["tests"]
+python_files = ["test_*.py"]
