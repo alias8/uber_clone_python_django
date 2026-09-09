@@ -366,8 +366,6 @@ pytest -q         # tests — spins up a real throwaway Postgres, Redis, AND Kaf
                    # part of a cold run (~30-40s to become ready).
 ```
 
-All three run in CI on every push/PR (`.github/workflows/ci.yml`).
-
 ## Status
 
 Milestones 1-5 done: Django/DRF skeleton, JWT-cookie auth with the dual-role design, the full ride
