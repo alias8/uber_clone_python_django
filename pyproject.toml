@@ -36,6 +36,12 @@ dev = [
     # whatever `redis` package this project already installs for its own client (rides/redis_client.py)
     # to be present at all — it doesn't require a specific version.
     "testcontainers[postgres,kafka]>=4.15",
+    # Transitive dep pulled in by testcontainers[kafka]. cbor2>=6 ships no prebuilt wheel for
+    # some platform/Python combos (e.g. macOS x86_64 on 3.12 as of this writing) and falls back to
+    # building its Rust extension from source, which fails without a Rust toolchain installed.
+    # <6 resolves to 5.9.0, which still ships a pure-Python wheel — pinned here rather than
+    # requiring every dev machine to have Rust just to install this project.
+    "cbor2<6",
 ]
 
 [build-system]

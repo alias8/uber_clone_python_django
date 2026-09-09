@@ -17,20 +17,48 @@ ALLOWED_HOSTS = ["*"]
 
 INSTALLED_APPS = [
     # "daphne" first: Channels' documented pattern for making `manage.py runserver` itself serve
-    # ASGI_APPLICATION (below) via Daphne instead of Django's default WSGI dev server — this repo
-    # has no django.contrib.staticfiles installed, so there's no ordering conflict with that app's
-    # own runserver override to worry about.
+    # ASGI_APPLICATION (below) via Daphne instead of Django's default WSGI dev server. Kept ahead
+    # of "django.contrib.staticfiles" below so daphne's runserver override still wins — staticfiles
+    # has its own runserver override (only for serving static assets in DEBUG), and Django resolves
+    # command overrides by INSTALLED_APPS order.
     "daphne",
+    "django.contrib.admin",
     "django.contrib.auth",
     "django.contrib.contenttypes",
+    "django.contrib.sessions",
+    "django.contrib.messages",
+    "django.contrib.staticfiles",
     "rest_framework",
     "channels",
     "rides",
 ]
 
 MIDDLEWARE = [
+    "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.common.CommonMiddleware",
+    "django.middleware.csrf.CsrfViewMiddleware",
+    "django.contrib.auth.middleware.AuthenticationMiddleware",
+    "django.contrib.messages.middleware.MessageMiddleware",
 ]
+
+# Required by django.contrib.admin's own templates (messages/auth context processors) — this repo
+# had no TEMPLATES setting before since none of the app's own views render server-side templates.
+TEMPLATES = [
+    {
+        "BACKEND": "django.template.backends.django.DjangoTemplates",
+        "DIRS": [],
+        "APP_DIRS": True,
+        "OPTIONS": {
+            "context_processors": [
+                "django.template.context_processors.request",
+                "django.contrib.auth.context_processors.auth",
+                "django.contrib.messages.context_processors.messages",
+            ],
+        },
+    },
+]
+
+STATIC_URL = "static/"
 
 ROOT_URLCONF = "config.urls"
 WSGI_APPLICATION = "config.wsgi.application"
